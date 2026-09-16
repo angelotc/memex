@@ -644,6 +644,27 @@ fn index_transcript_file(
         .unwrap_or_else(|| SourceKind::Antigravity.label())
         .to_string();
 
+    // Text-bearing steps share one record shape; only the role and event id
+    // vary. Tool-bearing steps fill their own tool fields and stay inline.
+    let text_record = |ts: u64, turn_id: u32, role: &str, text: String, event_id: String| Record {
+        source: SourceKind::Antigravity,
+        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+        ts,
+        project: project.to_string(),
+        session_id: session_id.to_string(),
+        turn_id,
+        role: role.to_string(),
+        text,
+        tool_name: None,
+        tool_input: None,
+        tool_output: None,
+        links: RecordLinks {
+            event_id: Some(event_id),
+            ..Default::default()
+        },
+        source_path: source_path.to_string(),
+    };
+
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -676,25 +697,13 @@ fn index_transcript_file(
                 if text.is_empty() {
                     continue;
                 }
-                let links = RecordLinks {
-                    event_id: Some(format!("{session_id}:{step_index}")),
-                    ..Default::default()
-                };
-                emit(Record {
-                    source: SourceKind::Antigravity,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                emit(text_record(
                     ts,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
                     turn_id,
-                    role: "user".to_string(),
+                    "user",
                     text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links,
-                    source_path: source_path.to_string(),
-                })?;
+                    format!("{session_id}:{step_index}"),
+                ))?;
                 turn_id += 1;
             }
             "PLANNER_RESPONSE" => {
@@ -703,25 +712,13 @@ fn index_transcript_file(
                 {
                     let trimmed = thinking.trim();
                     if !trimmed.is_empty() {
-                        let links = RecordLinks {
-                            event_id: Some(format!("{session_id}:{step_index}:reasoning")),
-                            ..Default::default()
-                        };
-                        emit(Record {
-                            source: SourceKind::Antigravity,
-                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        emit(text_record(
                             ts,
-                            project: project.clone(),
-                            session_id: session_id.clone(),
                             turn_id,
-                            role: "reasoning".to_string(),
-                            text: trimmed.to_string(),
-                            tool_name: None,
-                            tool_input: None,
-                            tool_output: None,
-                            links,
-                            source_path: source_path.to_string(),
-                        })?;
+                            "reasoning",
+                            trimmed.to_string(),
+                            format!("{session_id}:{step_index}:reasoning"),
+                        ))?;
                         turn_id += 1;
                     }
                 }
@@ -729,25 +726,13 @@ fn index_transcript_file(
                 if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
-                        let links = RecordLinks {
-                            event_id: Some(format!("{session_id}:{step_index}:response")),
-                            ..Default::default()
-                        };
-                        emit(Record {
-                            source: SourceKind::Antigravity,
-                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        emit(text_record(
                             ts,
-                            project: project.clone(),
-                            session_id: session_id.clone(),
                             turn_id,
-                            role: "assistant".to_string(),
-                            text: trimmed.to_string(),
-                            tool_name: None,
-                            tool_input: None,
-                            tool_output: None,
-                            links,
-                            source_path: source_path.to_string(),
-                        })?;
+                            "assistant",
+                            trimmed.to_string(),
+                            format!("{session_id}:{step_index}:response"),
+                        ))?;
                         turn_id += 1;
                     }
                 }

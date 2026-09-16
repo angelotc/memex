@@ -570,7 +570,7 @@ fn extract_user_request(text: &str) -> &str {
 }
 
 /// Tool argument keys that carry a working directory, in preference order.
-const CWD_ARG_KEYS: &[&str] = &["Cwd", "DirectoryPath", "SearchPath"];
+const CWD_ARG_KEYS: &[&str] = &["Cwd", "DirectoryPath", "SearchPath", "SearchDirectory"];
 
 fn extract_cwd_from_json(value: &Value) -> Option<PathBuf> {
     if let Some(tool_calls) = value.get("tool_calls").and_then(Value::as_array) {

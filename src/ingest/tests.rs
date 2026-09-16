@@ -4736,6 +4736,55 @@ fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
 }
 
 #[test]
+fn antigravity_cli_transcript_ingests_through_full_scan_and_dirty_selection() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("gemini");
+    let logs = source.join("antigravity-cli/brain/sess-uuid-789/.system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    let _env = EnvVarGuard::set_os(&[("ANTIGRAVITY_HOME", Some(source.as_os_str()))]);
+    let write_transcript = |lines: &[&str]| fs::write(&transcript, lines.join("\n")).unwrap();
+    write_transcript(&[
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfind the leak\n</USER_REQUEST>"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"patched it"}"#,
+    ]);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.include_antigravity = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    assert_eq!(full().records_added, 2);
+    assert_eq!(indexed_texts(&paths), ["find the leak", "patched it"]);
+    assert_eq!(full().records_added, 0);
+
+    // The dirty path routes transcript.jsonl through selection (not just .db).
+    write_transcript(&[
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfind the leak\n</USER_REQUEST>"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"patched it"}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:58Z","content":"shipped"}"#,
+    ]);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let result = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([transcript.clone()]),
+    )
+    .unwrap();
+    assert!(!result.full_scan);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["find the leak", "patched it", "shipped"]
+    );
+}
+
+#[test]
 fn cleanup_recovery_restores_reparsed_survivor_vectors() {
     assert_recovers_vector_crash(false, false);
     assert_recovers_vector_crash(true, false);

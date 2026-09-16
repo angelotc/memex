@@ -83,9 +83,43 @@ pub(crate) fn is_transcript_path(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl")
 }
 
+/// Richness ranking of a conversation's projections: lower wins. A cli
+/// conversation writes several projections of the same trajectory, so they
+/// compete for one slot per session uuid.
+fn projection_rank(path: &Path) -> u8 {
+    if is_transcript_path(path) {
+        0
+    } else if is_db_path(path) {
+        1
+    } else {
+        2
+    }
+}
+
 pub fn discover() -> Vec<SourceFile> {
     let base = sessions_root();
-    let mut files = Vec::new();
+    // One entry per conversation uuid: the conversation store is named
+    // `<uuid>.db` and the brain log lives under `brain/<uuid>/`, so both key
+    // the same session. Keep only the richest projection (transcript.jsonl >
+    // .db store > overview.txt) instead of indexing the conversation twice.
+    let mut by_session: std::collections::HashMap<String, SourceFile> =
+        std::collections::HashMap::new();
+    let mut keep_richest = |key: Option<String>, path: PathBuf| {
+        let Some(key) = key else { return };
+        let rank = projection_rank(&path);
+        let replace = by_session
+            .get(&key)
+            .is_none_or(|existing| projection_rank(&existing.path) > rank);
+        if replace {
+            by_session.insert(
+                key,
+                SourceFile {
+                    source: SourceKind::Antigravity,
+                    path,
+                },
+            );
+        }
+    };
     for profile in PROFILES {
         let conversations = base.join(profile).join("conversations");
         if conversations.is_dir()
@@ -94,10 +128,11 @@ pub fn discover() -> Vec<SourceFile> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if is_db_path(&path) {
-                    files.push(SourceFile {
-                        source: SourceKind::Antigravity,
-                        path,
-                    });
+                    let key = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string);
+                    keep_richest(key, path);
                 }
             }
         }
@@ -109,40 +144,14 @@ pub fn discover() -> Vec<SourceFile> {
                     && (is_overview_path(path) || is_transcript_path(path))
                     && path.to_string_lossy().contains(".system_generated/logs/")
                 {
-                    files.push(SourceFile {
-                        source: SourceKind::Antigravity,
-                        path: path.to_path_buf(),
-                    });
+                    keep_richest(Some(session_id_from_brain_path(path)), path.to_path_buf());
                 }
             }
         }
     }
-    // Deduplicate: if a session directory has both transcript.jsonl and overview.txt, prefer transcript.jsonl
-    let mut by_session: std::collections::HashMap<String, PathBuf> =
-        std::collections::HashMap::new();
-    for file in files {
-        if is_db_path(&file.path) {
-            by_session.insert(file.path.to_string_lossy().into_owned(), file.path);
-        } else {
-            let session_id = session_id_from_brain_path(&file.path);
-            if let Some(existing) = by_session.get(&session_id) {
-                if is_transcript_path(&file.path) && is_overview_path(existing) {
-                    by_session.insert(session_id, file.path);
-                }
-            } else {
-                by_session.insert(session_id, file.path);
-            }
-        }
-    }
-    let mut result: Vec<SourceFile> = by_session
-        .into_values()
-        .map(|path| SourceFile {
-            source: SourceKind::Antigravity,
-            path,
-        })
-        .collect();
-    result.sort_by(|a, b| a.path.cmp(&b.path));
-    result
+    let mut files: Vec<SourceFile> = by_session.into_values().collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
 pub fn usage_files() -> Vec<PathBuf> {
@@ -1497,6 +1506,60 @@ mod tests {
 
         assert_eq!(records[4].role, "assistant");
         assert_eq!(records[4].text, "Done fixing!");
+    }
+
+    #[test]
+    fn discover_keeps_richest_projection_per_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("ANTIGRAVITY_HOME", Some(temp.path().to_str().unwrap()))]);
+
+        // A cli conversation with all three projections: transcript.jsonl wins.
+        let cli_conv = temp.path().join("antigravity-cli/conversations/aaa-111.db");
+        fs::create_dir_all(cli_conv.parent().unwrap()).unwrap();
+        fs::write(&cli_conv, b"").unwrap();
+        let cli_logs = temp
+            .path()
+            .join("antigravity-cli/brain/aaa-111/.system_generated/logs");
+        fs::create_dir_all(&cli_logs).unwrap();
+        fs::write(cli_logs.join("overview.txt"), b"{}").unwrap();
+        fs::write(cli_logs.join("transcript.jsonl"), b"{}").unwrap();
+
+        // An ide conversation with a store and overview.txt (no transcript):
+        // the store wins.
+        let ide_conv = temp.path().join("antigravity-ide/conversations/bbb-222.db");
+        fs::create_dir_all(ide_conv.parent().unwrap()).unwrap();
+        fs::write(&ide_conv, b"").unwrap();
+        let ide_logs = temp
+            .path()
+            .join("antigravity-ide/brain/bbb-222/.system_generated/logs");
+        fs::create_dir_all(&ide_logs).unwrap();
+        fs::write(ide_logs.join("overview.txt"), b"{}").unwrap();
+
+        // A legacy conversation with only overview.txt: it survives.
+        let legacy_logs = temp
+            .path()
+            .join("antigravity/brain/ccc-333/.system_generated/logs");
+        fs::create_dir_all(&legacy_logs).unwrap();
+        fs::write(legacy_logs.join("overview.txt"), b"{}").unwrap();
+
+        let files = discover();
+        let paths: Vec<String> = files
+            .iter()
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 3, "paths: {paths:?}");
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("aaa-111/.system_generated/logs/transcript.jsonl"))
+        );
+        assert!(paths.iter().any(|p| p.ends_with("bbb-222.db")));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("ccc-333/.system_generated/logs/overview.txt"))
+        );
     }
 
     #[test]

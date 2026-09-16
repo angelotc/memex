@@ -177,7 +177,7 @@ pub(crate) fn parse_index_records(
     let source_path = path.to_string_lossy().to_string();
     let mut diagnostics = ParseDiagnostics::default();
     let (session_id, turn_id, offset, session_cwd) = if is_db_path(path) {
-        let (s_id, t_id, off) = index_db_file(
+        index_db_file(
             path,
             include_reasoning,
             next_doc_id,
@@ -185,9 +185,7 @@ pub(crate) fn parse_index_records(
             &source_path,
             &mut diagnostics,
             state.turn_id,
-        )?;
-        let cwd = session_cwd(path).map(|p| p.to_string_lossy().into_owned());
-        (s_id, t_id, off, cwd)
+        )?
     } else if is_transcript_path(path) {
         index_transcript_file(
             path,
@@ -199,16 +197,14 @@ pub(crate) fn parse_index_records(
             state.turn_id,
         )?
     } else if is_overview_path(path) {
-        let (s_id, t_id, off) = index_overview_file(
+        index_overview_file(
             path,
             next_doc_id,
             &mut emit,
             &source_path,
             &mut diagnostics,
             state.turn_id,
-        )?;
-        let cwd = session_cwd(path).map(|p| p.to_string_lossy().into_owned());
-        (s_id, t_id, off, cwd)
+        )?
     } else {
         anyhow::bail!(
             "unsupported antigravity file {} (expected a conversation .db, transcript.jsonl, or overview.txt)",
@@ -234,7 +230,7 @@ fn index_db_file(
     source_path: &str,
     diagnostics: &mut ParseDiagnostics,
     start_turn_id: u32,
-) -> Result<(String, u32, u64)> {
+) -> Result<(String, u32, u64, Option<String>)> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open antigravity store {}", path.display()))?;
     let store_id = |query: &str| {
@@ -254,8 +250,10 @@ fn index_db_file(
         .unwrap_or_else(|| "unknown".to_string());
 
     // Project heuristic: the user payload carries the active project root as a
-    // `file://` URL (payload `19.4.2.*.13`); take its leaf directory name.
+    // `file://` URL (payload `19.4.2.*.13`); take its leaf directory name and
+    // keep the decoded path itself as the session working directory.
     let mut project: Option<String> = None;
+    let mut session_cwd: Option<PathBuf> = None;
 
     let mut stmt = conn
         .prepare("SELECT step_type, status, step_payload FROM steps ORDER BY idx")
@@ -281,8 +279,18 @@ fn index_db_file(
         let step_type = step_type.max(0) as u64;
         let ts = step_timestamp(&payload);
         let message_id = step_message_id(&payload);
-        if project.is_none() && step_type == 14 {
-            project = project_from_user_payload(&payload);
+        if project.is_none()
+            && step_type == 14
+            && let Some(url) = project_root_from_payload(&payload)
+            && let Some(root) = file_url_path(&url)
+        {
+            if session_cwd.is_none() {
+                session_cwd = Some(root.clone());
+            }
+            project = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
         }
         match step_type {
             14 => {
@@ -411,7 +419,12 @@ fn index_db_file(
         }
     }
 
-    Ok((session_id, turn_id, file_len))
+    Ok((
+        session_id,
+        turn_id,
+        file_len,
+        session_cwd.map(|p| p.to_string_lossy().into_owned()),
+    ))
 }
 
 fn index_overview_file(
@@ -421,11 +434,12 @@ fn index_overview_file(
     source_path: &str,
     diagnostics: &mut ParseDiagnostics,
     start_turn_id: u32,
-) -> Result<(String, u32, u64)> {
+) -> Result<(String, u32, u64, Option<String>)> {
     let text = std::fs::read_to_string(path)?;
     let file_len = text.len() as u64;
     let session_id = path.to_string_lossy().to_string();
     let mut turn_id = start_turn_id;
+    let mut session_cwd: Option<PathBuf> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -435,6 +449,9 @@ fn index_overview_file(
             diagnostics.malformed_json_lines += 1;
             continue;
         };
+        if session_cwd.is_none() {
+            session_cwd = extract_cwd_from_json(&value);
+        }
         let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
             diagnostics.non_object_json_lines += 1;
             continue;
@@ -519,7 +536,12 @@ fn index_overview_file(
             other => diagnostics.increment_unknown_top_level(other),
         }
     }
-    Ok((session_id, turn_id, file_len))
+    Ok((
+        session_id,
+        turn_id,
+        file_len,
+        session_cwd.map(|p| p.to_string_lossy().into_owned()),
+    ))
 }
 
 fn session_id_from_brain_path(path: &Path) -> String {
@@ -803,14 +825,6 @@ fn index_transcript_file(
     Ok((session_id, turn_id, file_len, session_cwd_str))
 }
 
-/// Project name from a user step payload: the first `file://` project root at
-/// payload `19.4.2.*.13`. Returns the referenced path's leaf directory (the
-/// repo dir).
-fn project_from_user_payload(payload: &[u8]) -> Option<String> {
-    let url = project_root_from_payload(payload)?;
-    parse_file_url_leaf(&url)
-}
-
 /// The first `file://` project root at payload `19.4.2.*.13`, if any. Public for
 /// cross-module use (e.g. transfer's cwd resolution).
 pub(crate) fn project_root_from_payload(payload: &[u8]) -> Option<String> {
@@ -890,14 +904,6 @@ pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
 
 fn file_url_path(url: &str) -> Option<PathBuf> {
     url::Url::parse(url).ok()?.to_file_path().ok()
-}
-
-/// Decode a `file://` URL and return the referenced path's leaf directory.
-fn parse_file_url_leaf(url: &str) -> Option<String> {
-    file_url_path(url)?
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_string)
 }
 
 fn user_text(payload: &[u8]) -> Option<String> {
@@ -1263,15 +1269,24 @@ mod tests {
 
     #[test]
     fn project_looks_for_file_project_root_field() {
-        // Index under the 19.4.2.13 shaped envelope.
-        // Build: 19 { 4 { 2 { 13: "file:///Users/x/src/repo-api" } } } merged with text.
-        let project_block = field_bytes(13, b"file:///Users/x/src/repo-api");
-        let inner2 = field_bytes(2, &project_block);
-        let inner4 = field_bytes(4, &inner2);
-        let mut msg = field_varint(1, 14);
-        msg.extend(field_bytes(5, &field_bytes(1, &timestamp_msg(1, 0))));
-        msg.extend(field_bytes(19, &inner4));
-        assert_eq!(project_from_user_payload(&msg).as_deref(), Some("repo-api"));
+        // Index under the 19.4.2.13 shaped envelope:
+        // 19 { 2: text, 4 { 2 { 13: "file:///Users/x/src/repo-api" } } }.
+        let temp = tempfile::tempdir().unwrap();
+        let db = write_store(temp.path());
+        let conn = Connection::open(&db).unwrap();
+        let mut user = field_bytes(2, b"do it");
+        user.extend(field_bytes(
+            4,
+            &field_bytes(2, &field_bytes(13, b"file:///Users/x/src/repo-api")),
+        ));
+        conn.execute(
+            "UPDATE steps SET step_payload = ?1 WHERE idx = 0",
+            rusqlite::params![field_bytes(19, &user)],
+        )
+        .unwrap();
+        let (records, output) = emit_collect(&db, false);
+        assert!(records.iter().all(|record| record.project == "repo-api"));
+        assert_eq!(output.session_cwd.as_deref(), Some("/Users/x/src/repo-api"));
     }
 
     #[test]
@@ -1318,7 +1333,12 @@ mod tests {
 
         assert_eq!(session_cwd(&db).as_deref(), Some(cwd.as_path()));
         assert!(session_cwd(&db).unwrap().is_dir());
-        let (records, _) = emit_collect(&db, false);
+        let (records, output) = emit_collect(&db, false);
+        // Directory URLs decode with a trailing slash; compare as paths.
+        assert_eq!(
+            output.session_cwd.as_deref().map(Path::new),
+            Some(cwd.as_path())
+        );
         assert!(
             records
                 .iter()

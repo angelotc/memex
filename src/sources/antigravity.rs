@@ -620,9 +620,12 @@ fn index_transcript_file(
     let file_len = text.len() as u64;
     let session_id = session_id_from_brain_path(path);
     let mut turn_id = start_turn_id;
-    let mut session_cwd: Option<PathBuf> = None;
 
-    for line in text.lines().take(100) {
+    // Resolve the working directory before emitting anything so every record
+    // carries the same project: tool invocations hold it in their args, and a
+    // cwd found mid-file would otherwise split the session across two projects.
+    let mut session_cwd: Option<PathBuf> = None;
+    for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -634,6 +637,12 @@ fn index_transcript_file(
             break;
         }
     }
+    let project = session_cwd
+        .as_ref()
+        .and_then(|cwd| cwd.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| SourceKind::Antigravity.label())
+        .to_string();
 
     for line in text.lines() {
         let line = line.trim();
@@ -644,10 +653,6 @@ fn index_transcript_file(
             diagnostics.malformed_json_lines += 1;
             continue;
         };
-
-        if session_cwd.is_none() {
-            session_cwd = extract_cwd_from_json(&value);
-        }
 
         let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
             diagnostics.non_object_json_lines += 1;
@@ -664,13 +669,6 @@ fn index_transcript_file(
             .and_then(|v| v.as_u64())
             .unwrap_or(turn_id as u64);
 
-        let project = session_cwd
-            .as_ref()
-            .and_then(|cwd| cwd.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or_else(|| SourceKind::Antigravity.label())
-            .to_string();
-
         match kind {
             "USER_INPUT" if status == "DONE" => {
                 let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -686,7 +684,7 @@ fn index_transcript_file(
                     source: SourceKind::Antigravity,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts,
-                    project,
+                    project: project.clone(),
                     session_id: session_id.clone(),
                     turn_id,
                     role: "user".to_string(),
@@ -798,7 +796,7 @@ fn index_transcript_file(
                         source: SourceKind::Antigravity,
                         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                         ts,
-                        project,
+                        project: project.clone(),
                         session_id: session_id.clone(),
                         turn_id,
                         role: "tool".to_string(),

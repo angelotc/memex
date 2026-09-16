@@ -71,17 +71,11 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         "grok" if remote || find_in_path("grok").is_some() => {
             Some("cd {cwd_shell} && grok --resume {session_id}".to_string())
         }
-        "antigravity"
-            if remote || find_in_path("agy").is_some() || find_in_path("antigravity").is_some() =>
-        {
-            let bin = if find_in_path("agy").is_some() {
-                "agy"
-            } else {
-                "antigravity"
-            };
-            Some(format!(
-                "cd {{cwd_shell}} && {bin} --conversation {{session_id}}"
-            ))
+        "antigravity" if remote || find_in_path("agy").is_some() => {
+            Some("cd {cwd_shell} && agy --conversation {session_id}".to_string())
+        }
+        "antigravity" if find_in_path("antigravity").is_some() => {
+            Some("cd {cwd_shell} && antigravity --conversation {session_id}".to_string())
         }
         _ => None,
     }
@@ -177,6 +171,14 @@ mod tests {
         assert_eq!(
             default_resume_template("opencode", true).as_deref(),
             Some("opencode --session {session_id}")
+        );
+    }
+
+    #[test]
+    fn remote_antigravity_default_prefers_agy() {
+        assert_eq!(
+            default_resume_template("antigravity", true).as_deref(),
+            Some("cd {cwd_shell} && agy --conversation {session_id}")
         );
     }
 }

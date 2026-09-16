@@ -34,17 +34,17 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     // Rebuild analytics metadata with decoded project directory URLs.
-    identity: 3,
+    identity: 4,
     // Bumped whenever record extraction logic changes; forces a full re-parse.
-    index: 2,
+    index: 4,
     usage: 1,
 };
 
 /// The tool-bearing `step_type` values observed in real stores.
 const TOOL_STEP_TYPES: &[u64] = &[5, 7, 8, 9, 17, 21, 101, 132];
 
-/// Profiles searched for `conversations/` stores and `brain/` overview logs.
-const PROFILES: &[&str] = &["antigravity-ide", "antigravity"];
+/// Profiles searched for `conversations/` stores and `brain/` overview/transcript logs.
+const PROFILES: &[&str] = &["antigravity-cli", "antigravity-ide", "antigravity"];
 
 fn is_wal_or_shm(name: &str) -> bool {
     name.ends_with("-wal.db") || name.ends_with("-shm.db") || name.ends_with(".tmp")
@@ -59,7 +59,8 @@ pub fn matches_path(path: &str) -> bool {
     if normalized.ends_with(".db") || normalized.ends_with(".pb") {
         return normalized.contains("conversations/") && !is_wal_or_shm(&normalized);
     }
-    normalized.ends_with("overview.txt") && normalized.contains(".system_generated/logs/")
+    (normalized.ends_with("overview.txt") || normalized.ends_with("transcript.jsonl"))
+        && normalized.contains(".system_generated/logs/")
 }
 
 /// Root of all Antigravity profiles: `~/.gemini` by default.
@@ -76,6 +77,10 @@ pub(crate) fn is_db_path(path: &Path) -> bool {
 
 fn is_overview_path(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some("overview.txt")
+}
+
+pub(crate) fn is_transcript_path(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl")
 }
 
 pub fn discover() -> Vec<SourceFile> {
@@ -101,7 +106,7 @@ pub fn discover() -> Vec<SourceFile> {
             for entry in WalkDir::new(&brains).into_iter().flatten() {
                 let path = entry.path();
                 if entry.file_type().is_file()
-                    && is_overview_path(path)
+                    && (is_overview_path(path) || is_transcript_path(path))
                     && path.to_string_lossy().contains(".system_generated/logs/")
                 {
                     files.push(SourceFile {
@@ -112,9 +117,32 @@ pub fn discover() -> Vec<SourceFile> {
             }
         }
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files.dedup_by(|a, b| a.path == b.path);
-    files
+    // Deduplicate: if a session directory has both transcript.jsonl and overview.txt, prefer transcript.jsonl
+    let mut by_session: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    for file in files {
+        if is_db_path(&file.path) {
+            by_session.insert(file.path.to_string_lossy().into_owned(), file.path);
+        } else {
+            let session_id = session_id_from_brain_path(&file.path);
+            if let Some(existing) = by_session.get(&session_id) {
+                if is_transcript_path(&file.path) && is_overview_path(existing) {
+                    by_session.insert(session_id, file.path);
+                }
+            } else {
+                by_session.insert(session_id, file.path);
+            }
+        }
+    }
+    let mut result: Vec<SourceFile> = by_session
+        .into_values()
+        .map(|path| SourceFile {
+            source: SourceKind::Antigravity,
+            path,
+        })
+        .collect();
+    result.sort_by(|a, b| a.path.cmp(&b.path));
+    result
 }
 
 pub fn usage_files() -> Vec<PathBuf> {
@@ -139,8 +167,20 @@ pub(crate) fn parse_index_records(
     // re-parses, so `state.offset` is intentionally ignored below.
     let source_path = path.to_string_lossy().to_string();
     let mut diagnostics = ParseDiagnostics::default();
-    let (session_id, turn_id, offset) = if is_db_path(path) {
-        index_db_file(
+    let (session_id, turn_id, offset, session_cwd) = if is_db_path(path) {
+        let (s_id, t_id, off) = index_db_file(
+            path,
+            include_reasoning,
+            next_doc_id,
+            &mut emit,
+            &source_path,
+            &mut diagnostics,
+            state.turn_id,
+        )?;
+        let cwd = session_cwd(path).map(|p| p.to_string_lossy().into_owned());
+        (s_id, t_id, off, cwd)
+    } else if is_transcript_path(path) {
+        index_transcript_file(
             path,
             include_reasoning,
             next_doc_id,
@@ -150,17 +190,19 @@ pub(crate) fn parse_index_records(
             state.turn_id,
         )?
     } else if is_overview_path(path) {
-        index_overview_file(
+        let (s_id, t_id, off) = index_overview_file(
             path,
             next_doc_id,
             &mut emit,
             &source_path,
             &mut diagnostics,
             state.turn_id,
-        )?
+        )?;
+        let cwd = session_cwd(path).map(|p| p.to_string_lossy().into_owned());
+        (s_id, t_id, off, cwd)
     } else {
         anyhow::bail!(
-            "unsupported antigravity file {} (expected a conversation .db or overview.txt)",
+            "unsupported antigravity file {} (expected a conversation .db, transcript.jsonl, or overview.txt)",
             path.display()
         );
     };
@@ -171,7 +213,7 @@ pub(crate) fn parse_index_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id),
         diagnostics,
-        session_cwd: None,
+        session_cwd,
     })
 }
 
@@ -471,6 +513,287 @@ fn index_overview_file(
     Ok((session_id, turn_id, file_len))
 }
 
+fn session_id_from_brain_path(path: &Path) -> String {
+    let mut current = path.parent();
+    while let Some(p) = current {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.is_empty() && name != "logs" && name != ".system_generated" && name != "brain" {
+            return name.to_string();
+        }
+        current = p.parent();
+    }
+    path.file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn extract_user_request(text: &str) -> &str {
+    if let Some(start) = text.find("<USER_REQUEST>") {
+        let after = &text[start + "<USER_REQUEST>".len()..];
+        if let Some(end) = after.find("</USER_REQUEST>") {
+            return after[..end].trim();
+        }
+    }
+    text.trim()
+}
+
+fn extract_cwd_from_json(value: &Value) -> Option<PathBuf> {
+    if let Some(tool_calls) = value.get("tool_calls").and_then(Value::as_array) {
+        for call in tool_calls {
+            if let Some(args) = call.get("args") {
+                if let Some(cwd) = args.get("Cwd").and_then(Value::as_str) {
+                    let s = cwd.trim().trim_matches('"');
+                    if !s.is_empty() {
+                        return Some(PathBuf::from(s));
+                    }
+                }
+                if let Some(cwd) = args.get("DirectoryPath").and_then(Value::as_str) {
+                    let s = cwd.trim().trim_matches('"');
+                    if !s.is_empty() {
+                        return Some(PathBuf::from(s));
+                    }
+                }
+                if let Some(cwd) = args.get("SearchPath").and_then(Value::as_str) {
+                    let s = cwd.trim().trim_matches('"');
+                    if !s.is_empty() {
+                        return Some(PathBuf::from(s));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_str)
+        && let Some(idx) = content.find("[URI] -> [CorpusName]:")
+    {
+        let rest = &content[idx + "[URI] -> [CorpusName]:".len()..];
+        for line in rest.lines() {
+            let trimmed = line.trim();
+            if let Some((uri, _)) = trimmed.split_once("->") {
+                let s = uri.trim();
+                if !s.is_empty() {
+                    return Some(PathBuf::from(s));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn index_transcript_file(
+    path: &Path,
+    include_reasoning: bool,
+    next_doc_id: &AtomicU64,
+    emit: &mut impl FnMut(Record) -> Result<()>,
+    source_path: &str,
+    diagnostics: &mut ParseDiagnostics,
+    start_turn_id: u32,
+) -> Result<(String, u32, u64, Option<String>)> {
+    let text = std::fs::read_to_string(path)?;
+    let file_len = text.len() as u64;
+    let session_id = session_id_from_brain_path(path);
+    let mut turn_id = start_turn_id;
+    let mut session_cwd: Option<PathBuf> = None;
+
+    for line in text.lines().take(100) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line)
+            && let Some(cwd) = extract_cwd_from_json(&value)
+        {
+            session_cwd = Some(cwd);
+            break;
+        }
+    }
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            diagnostics.malformed_json_lines += 1;
+            continue;
+        };
+
+        if session_cwd.is_none() {
+            session_cwd = extract_cwd_from_json(&value);
+        }
+
+        let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
+            diagnostics.non_object_json_lines += 1;
+            continue;
+        };
+        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = value
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .and_then(super::common::parse_iso_millis)
+            .unwrap_or(0);
+        let step_index = value
+            .get("step_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(turn_id as u64);
+
+        let project = session_cwd
+            .as_ref()
+            .and_then(|cwd| cwd.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| SourceKind::Antigravity.label())
+            .to_string();
+
+        match kind {
+            "USER_INPUT" if status == "DONE" => {
+                let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let text = extract_user_request(content).to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let links = RecordLinks {
+                    event_id: Some(format!("{session_id}:{step_index}")),
+                    ..Default::default()
+                };
+                emit(Record {
+                    source: SourceKind::Antigravity,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts,
+                    project,
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "user".to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.to_string(),
+                })?;
+                turn_id += 1;
+            }
+            "PLANNER_RESPONSE" => {
+                if include_reasoning
+                    && let Some(thinking) = value.get("thinking").and_then(|v| v.as_str())
+                {
+                    let trimmed = thinking.trim();
+                    if !trimmed.is_empty() {
+                        let links = RecordLinks {
+                            event_id: Some(format!("{session_id}:{step_index}:reasoning")),
+                            ..Default::default()
+                        };
+                        emit(Record {
+                            source: SourceKind::Antigravity,
+                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                            ts,
+                            project: project.clone(),
+                            session_id: session_id.clone(),
+                            turn_id,
+                            role: "reasoning".to_string(),
+                            text: trimmed.to_string(),
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                            links,
+                            source_path: source_path.to_string(),
+                        })?;
+                        turn_id += 1;
+                    }
+                }
+
+                if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        let links = RecordLinks {
+                            event_id: Some(format!("{session_id}:{step_index}:response")),
+                            ..Default::default()
+                        };
+                        emit(Record {
+                            source: SourceKind::Antigravity,
+                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                            ts,
+                            project: project.clone(),
+                            session_id: session_id.clone(),
+                            turn_id,
+                            role: "assistant".to_string(),
+                            text: trimmed.to_string(),
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                            links,
+                            source_path: source_path.to_string(),
+                        })?;
+                        turn_id += 1;
+                    }
+                }
+
+                if let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array()) {
+                    for (call_idx, call) in tool_calls.iter().enumerate() {
+                        let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let args_str = call.get("args").map(|v| v.to_string()).unwrap_or_default();
+                        let summary = call
+                            .get("args")
+                            .and_then(|a| a.get("toolSummary").or_else(|| a.get("toolAction")))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.trim_matches('"').to_string());
+                        let links = RecordLinks {
+                            event_id: Some(format!("{session_id}:{step_index}:call:{call_idx}")),
+                            ..Default::default()
+                        };
+                        emit(Record {
+                            source: SourceKind::Antigravity,
+                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                            ts,
+                            project: project.clone(),
+                            session_id: session_id.clone(),
+                            turn_id,
+                            role: "tool_use".to_string(),
+                            text: format!("{name} {args_str}"),
+                            tool_name: Some(name.to_string()),
+                            tool_input: Some(args_str),
+                            tool_output: summary,
+                            links,
+                            source_path: source_path.to_string(),
+                        })?;
+                        turn_id += 1;
+                    }
+                }
+            }
+            "GENERIC" => {
+                let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let links = RecordLinks {
+                        event_id: Some(format!("{session_id}:{step_index}:output")),
+                        ..Default::default()
+                    };
+                    emit(Record {
+                        source: SourceKind::Antigravity,
+                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        ts,
+                        project,
+                        session_id: session_id.clone(),
+                        turn_id,
+                        role: "tool".to_string(),
+                        text: trimmed.to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: Some(trimmed.to_string()),
+                        links,
+                        source_path: source_path.to_string(),
+                    })?;
+                    turn_id += 1;
+                }
+            }
+            "SYSTEM_MESSAGE" => {}
+            other => diagnostics.increment_unknown_top_level(other),
+        }
+    }
+
+    let session_cwd_str = session_cwd.map(|p| p.to_string_lossy().into_owned());
+    Ok((session_id, turn_id, file_len, session_cwd_str))
+}
+
 /// Project name from a user step payload: the first `file://` project root at
 /// payload `19.4.2.*.13`. Returns the referenced path's leaf directory (the
 /// repo dir).
@@ -521,23 +844,36 @@ pub(crate) fn project_root_from_payload(payload: &[u8]) -> Option<String> {
 /// Antigravity records the active project root as a `file://` URL on user
 /// steps. This is used by analytics to resolve the enclosing Git repository.
 pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
-    if !is_db_path(path) {
+    if is_db_path(path) {
+        let conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        let mut stmt = conn
+            .prepare("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx")
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()?;
+        for payload in rows.flatten().flatten() {
+            let Some(url) = project_root_from_payload(&payload) else {
+                continue;
+            };
+            if let Some(root) = file_url_path(&url) {
+                return Some(root);
+            }
+        }
         return None;
     }
-    let conn =
-        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    let mut stmt = conn
-        .prepare("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx")
-        .ok()?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
-        .ok()?;
-    for payload in rows.flatten().flatten() {
-        let Some(url) = project_root_from_payload(&payload) else {
-            continue;
-        };
-        if let Some(root) = file_url_path(&url) {
-            return Some(root);
+    if (is_transcript_path(path) || is_overview_path(path))
+        && let Ok(file) = std::fs::File::open(path)
+    {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(file);
+        for line in reader.lines().take(100).flatten() {
+            if let Ok(val) = serde_json::from_str::<Value>(&line)
+                && let Some(cwd) = extract_cwd_from_json(&val)
+            {
+                return Some(cwd);
+            }
         }
     }
     None
@@ -1114,9 +1450,63 @@ mod tests {
         assert!(matches_path(
             "/Users/x/.gemini/antigravity/brain/comp/.system_generated/logs/overview.txt"
         ));
+        assert!(matches_path(
+            "/Users/x/.gemini/antigravity-cli/brain/uuid-123/.system_generated/logs/transcript.jsonl"
+        ));
         assert!(!matches_path(
             "/Users/x/.gemini/antigravity-ide/conversations/abc.db-wal"
         ));
         assert!(!matches_path("/Users/x/.claude/projects/abc.jsonl"));
+    }
+
+    #[test]
+    fn parses_transcript_jsonl_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let logs = temp
+            .path()
+            .join("brain/sess-uuid-456/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfix the bug\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-15T23:44:55Z","thinking":"Planning fix","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test","Cwd":"/apps/myproj"}}]}
+{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"test passed"}
+{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-15T23:44:57Z","content":"Done fixing!"}"#,
+        )
+        .unwrap();
+
+        let (records, output) = emit_collect(&transcript, true);
+        assert_eq!(output.session_id.as_deref(), Some("sess-uuid-456"));
+        assert_eq!(output.session_cwd.as_deref(), Some("/apps/myproj"));
+
+        // Expect: user, reasoning, tool_use, tool, assistant
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[0].role, "user");
+        assert_eq!(records[0].text, "fix the bug");
+        assert_eq!(records[0].project, "myproj");
+
+        assert_eq!(records[1].role, "reasoning");
+        assert_eq!(records[1].text, "Planning fix");
+
+        assert_eq!(records[2].role, "tool_use");
+        assert_eq!(records[2].tool_name.as_deref(), Some("run_command"));
+
+        assert_eq!(records[3].role, "tool");
+        assert_eq!(records[3].text, "test passed");
+
+        assert_eq!(records[4].role, "assistant");
+        assert_eq!(records[4].text, "Done fixing!");
+    }
+
+    #[test]
+    fn session_id_from_brain_path_finds_uuid() {
+        let path = Path::new(
+            "/root/.gemini/antigravity-cli/brain/e2a4562b-5476-4222-84bf-5110195946bf/.system_generated/logs/transcript.jsonl",
+        );
+        assert_eq!(
+            session_id_from_brain_path(path),
+            "e2a4562b-5476-4222-84bf-5110195946bf"
+        );
     }
 }

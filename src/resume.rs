@@ -35,7 +35,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Hermes => None,
         SourceKind::Jcode => config.jcode_resume_cmd.clone(),
         SourceKind::Muse => config.muse_resume_cmd.clone(),
-        SourceKind::Antigravity => None,
+        SourceKind::Antigravity => config.antigravity_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -70,6 +70,18 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "grok" if remote || find_in_path("grok").is_some() => {
             Some("cd {cwd_shell} && grok --resume {session_id}".to_string())
+        }
+        "antigravity"
+            if remote || find_in_path("agy").is_some() || find_in_path("antigravity").is_some() =>
+        {
+            let bin = if find_in_path("agy").is_some() {
+                "agy"
+            } else {
+                "antigravity"
+            };
+            Some(format!(
+                "cd {{cwd_shell}} && {bin} --conversation {{session_id}}"
+            ))
         }
         _ => None,
     }

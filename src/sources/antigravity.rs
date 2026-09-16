@@ -569,27 +569,23 @@ fn extract_user_request(text: &str) -> &str {
     text.trim()
 }
 
+/// Tool argument keys that carry a working directory, in preference order.
+const CWD_ARG_KEYS: &[&str] = &["Cwd", "DirectoryPath", "SearchPath"];
+
 fn extract_cwd_from_json(value: &Value) -> Option<PathBuf> {
     if let Some(tool_calls) = value.get("tool_calls").and_then(Value::as_array) {
         for call in tool_calls {
-            if let Some(args) = call.get("args") {
-                if let Some(cwd) = args.get("Cwd").and_then(Value::as_str) {
-                    let s = cwd.trim().trim_matches('"');
-                    if !s.is_empty() {
-                        return Some(PathBuf::from(s));
-                    }
-                }
-                if let Some(cwd) = args.get("DirectoryPath").and_then(Value::as_str) {
-                    let s = cwd.trim().trim_matches('"');
-                    if !s.is_empty() {
-                        return Some(PathBuf::from(s));
-                    }
-                }
-                if let Some(cwd) = args.get("SearchPath").and_then(Value::as_str) {
-                    let s = cwd.trim().trim_matches('"');
-                    if !s.is_empty() {
-                        return Some(PathBuf::from(s));
-                    }
+            let Some(args) = call.get("args") else {
+                continue;
+            };
+            for key in CWD_ARG_KEYS {
+                if let Some(dir) = args
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().trim_matches('"'))
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(PathBuf::from(dir));
                 }
             }
         }

@@ -33,10 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
-    // Rebuild analytics metadata with decoded project directory URLs.
-    identity: 4,
+    // Rebuild analytics metadata with normalized overview IDs and reliable CWDs.
+    identity: 5,
     // Bumped whenever record extraction logic changes; forces a full re-parse.
-    index: 4,
+    index: 5,
     usage: 1,
 };
 
@@ -59,7 +59,9 @@ pub fn matches_path(path: &str) -> bool {
     if normalized.ends_with(".db") || normalized.ends_with(".pb") {
         return normalized.contains("conversations/") && !is_wal_or_shm(&normalized);
     }
-    (normalized.ends_with("overview.txt") || normalized.ends_with("transcript.jsonl"))
+    (normalized.ends_with("overview.txt")
+        || normalized.ends_with("transcript.jsonl")
+        || normalized.ends_with("transcript_full.jsonl"))
         && normalized.contains(".system_generated/logs/")
 }
 
@@ -80,76 +82,87 @@ fn is_overview_path(path: &Path) -> bool {
 }
 
 pub(crate) fn is_transcript_path(path: &Path) -> bool {
-    path.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl")
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("transcript.jsonl" | "transcript_full.jsonl")
+    )
 }
 
-/// Richness ranking of a conversation's projections: lower wins. A cli
-/// conversation writes several projections of the same trajectory, so they
-/// compete for one slot per session uuid.
-fn projection_rank(path: &Path) -> u8 {
-    if is_transcript_path(path) {
-        0
-    } else if is_db_path(path) {
-        1
+/// Shared conversation identity for sibling projections, independent of format.
+pub(crate) fn projection_session_id(path: &Path) -> Option<String> {
+    if is_db_path(path) {
+        path.file_stem()?.to_str().map(str::to_string)
+    } else if is_transcript_path(path) || is_overview_path(path) {
+        Some(session_id_from_brain_path(path))
     } else {
-        2
+        None
     }
+}
+
+/// All supported locations in canonical preference order, including absent files.
+pub(crate) fn projection_paths(session_id: &str) -> Vec<PathBuf> {
+    let base = sessions_root();
+    let mut paths = Vec::new();
+    for name in [
+        "transcript_full.jsonl",
+        "transcript.jsonl",
+        "database",
+        "overview.txt",
+    ] {
+        for profile in PROFILES {
+            let root = base.join(profile);
+            paths.push(if name == "database" {
+                root.join("conversations").join(format!("{session_id}.db"))
+            } else {
+                root.join("brain")
+                    .join(session_id)
+                    .join(".system_generated/logs")
+                    .join(name)
+            });
+        }
+    }
+    paths
 }
 
 pub fn discover() -> Vec<SourceFile> {
     let base = sessions_root();
-    // One entry per conversation uuid: the conversation store is named
-    // `<uuid>.db` and the brain log lives under `brain/<uuid>/`, so both key
-    // the same session. Keep only the richest projection (transcript.jsonl >
-    // .db store > overview.txt) instead of indexing the conversation twice.
-    let mut by_session: std::collections::HashMap<String, SourceFile> =
-        std::collections::HashMap::new();
-    let mut keep_richest = |key: Option<String>, path: PathBuf| {
-        let Some(key) = key else { return };
-        let rank = projection_rank(&path);
-        let replace = by_session
-            .get(&key)
-            .is_none_or(|existing| projection_rank(&existing.path) > rank);
-        if replace {
-            by_session.insert(
-                key,
-                SourceFile {
-                    source: SourceKind::Antigravity,
-                    path,
-                },
-            );
-        }
-    };
+    let mut sessions = std::collections::HashSet::new();
     for profile in PROFILES {
-        let conversations = base.join(profile).join("conversations");
-        if conversations.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&conversations)
-        {
+        let root = base.join(profile);
+        if let Ok(entries) = std::fs::read_dir(root.join("conversations")) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if is_db_path(&path) {
-                    let key = path
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .map(str::to_string);
-                    keep_richest(key, path);
+                if path.is_file()
+                    && is_db_path(&path)
+                    && let Some(key) = projection_session_id(&path)
+                {
+                    sessions.insert(key);
                 }
             }
         }
-        let brains = base.join(profile).join("brain");
-        if brains.is_dir() {
-            for entry in WalkDir::new(&brains).into_iter().flatten() {
-                let path = entry.path();
-                if entry.file_type().is_file()
-                    && (is_overview_path(path) || is_transcript_path(path))
-                    && path.to_string_lossy().contains(".system_generated/logs/")
-                {
-                    keep_richest(Some(session_id_from_brain_path(path)), path.to_path_buf());
-                }
+        for entry in WalkDir::new(root.join("brain")).into_iter().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_file()
+                && (is_transcript_path(path) || is_overview_path(path))
+                && path
+                    .parent()
+                    .is_some_and(|p| p.ends_with(".system_generated/logs"))
+                && let Some(key) = projection_session_id(path)
+            {
+                sessions.insert(key);
             }
         }
     }
-    let mut files: Vec<SourceFile> = by_session.into_values().collect();
+    let by_session = sessions.into_iter().filter_map(|key| {
+        projection_paths(&key)
+            .into_iter()
+            .find(|path| path.is_file())
+            .map(|path| SourceFile {
+                source: SourceKind::Antigravity,
+                path,
+            })
+    });
+    let mut files: Vec<SourceFile> = by_session.collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
 }
@@ -207,7 +220,7 @@ pub(crate) fn parse_index_records(
         )?
     } else {
         anyhow::bail!(
-            "unsupported antigravity file {} (expected a conversation .db, transcript.jsonl, or overview.txt)",
+            "unsupported antigravity file {} (expected a conversation .db, transcript[_full].jsonl, or overview.txt)",
             path.display()
         );
     };
@@ -437,9 +450,9 @@ fn index_overview_file(
 ) -> Result<(String, u32, u64, Option<String>)> {
     let text = std::fs::read_to_string(path)?;
     let file_len = text.len() as u64;
-    let session_id = path.to_string_lossy().to_string();
+    let session_id = session_id_from_brain_path(path);
     let mut turn_id = start_turn_id;
-    let mut session_cwd: Option<PathBuf> = None;
+    let session_cwd = cwd_from_lines(text.lines());
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -449,9 +462,6 @@ fn index_overview_file(
             diagnostics.malformed_json_lines += 1;
             continue;
         };
-        if session_cwd.is_none() {
-            session_cwd = extract_cwd_from_json(&value);
-        }
         let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
             diagnostics.non_object_json_lines += 1;
             continue;
@@ -569,42 +579,49 @@ fn extract_user_request(text: &str) -> &str {
     text.trim()
 }
 
-/// Tool argument keys that carry a working directory, in preference order.
-const CWD_ARG_KEYS: &[&str] = &["Cwd", "DirectoryPath", "SearchPath", "SearchDirectory"];
+fn cwd_path(text: &str) -> Option<PathBuf> {
+    let text = text.trim().trim_matches('"');
+    if text.starts_with("file:") {
+        return file_url_path(text);
+    }
+    let path = PathBuf::from(text);
+    path.is_absolute().then_some(path)
+}
 
-fn extract_cwd_from_json(value: &Value) -> Option<PathBuf> {
-    if let Some(tool_calls) = value.get("tool_calls").and_then(Value::as_array) {
-        for call in tool_calls {
-            let Some(args) = call.get("args") else {
-                continue;
-            };
-            for key in CWD_ARG_KEYS {
-                if let Some(dir) = args
-                    .get(key)
+// Only explicit Cwd arguments and workspace mappings establish a project root.
+// SearchPath may name a file; DirectoryPath/SearchDirectory may name any subtree.
+fn workspace_mapping_cwd(value: &Value) -> Option<PathBuf> {
+    let content = value.get("content")?.as_str()?;
+    let (_, rest) = content.split_once("[URI] -> [CorpusName]:")?;
+    rest.lines()
+        .filter_map(|line| line.split_once("->"))
+        .find_map(|(uri, _)| cwd_path(uri))
+}
+
+fn cwd_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Option<PathBuf> {
+    let mut workspace = None;
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        // A later explicit Cwd must override an earlier workspace fallback.
+        if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let Some(cwd) = call
+                    .get("args")
+                    .and_then(|args| args.get("Cwd"))
                     .and_then(Value::as_str)
-                    .map(|s| s.trim().trim_matches('"'))
-                    .filter(|s| !s.is_empty())
+                    .and_then(cwd_path)
                 {
-                    return Some(PathBuf::from(dir));
+                    return Some(cwd);
                 }
             }
         }
-    }
-    if let Some(content) = value.get("content").and_then(Value::as_str)
-        && let Some(idx) = content.find("[URI] -> [CorpusName]:")
-    {
-        let rest = &content[idx + "[URI] -> [CorpusName]:".len()..];
-        for line in rest.lines() {
-            let trimmed = line.trim();
-            if let Some((uri, _)) = trimmed.split_once("->") {
-                let s = uri.trim();
-                if !s.is_empty() {
-                    return Some(PathBuf::from(s));
-                }
-            }
+        if workspace.is_none() {
+            workspace = workspace_mapping_cwd(&value);
         }
     }
-    None
+    workspace
 }
 
 fn index_transcript_file(
@@ -624,19 +641,7 @@ fn index_transcript_file(
     // Resolve the working directory before emitting anything so every record
     // carries the same project: tool invocations hold it in their args, and a
     // cwd found mid-file would otherwise split the session across two projects.
-    let mut session_cwd: Option<PathBuf> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(line)
-            && let Some(cwd) = extract_cwd_from_json(&value)
-        {
-            session_cwd = Some(cwd);
-            break;
-        }
-    }
+    let session_cwd = cwd_from_lines(text.lines());
     let project = session_cwd
         .as_ref()
         .and_then(|cwd| cwd.file_name())
@@ -689,6 +694,20 @@ fn index_transcript_file(
             .get("step_index")
             .and_then(|v| v.as_u64())
             .unwrap_or(turn_id as u64);
+
+        let mut emit = |mut record: Record| -> Result<()> {
+            if let Some(fields) = value.get("truncated_fields").and_then(Value::as_array)
+                && !fields.is_empty()
+            {
+                record.links.source_content =
+                    Some(serde_json::json!({"truncated_fields": fields}).to_string());
+                record.text.push_str(&format!(
+                    "\n[Antigravity truncated fields: {}]",
+                    Value::Array(fields.clone())
+                ));
+            }
+            emit(record)
+        };
 
         match kind {
             "USER_INPUT" if status == "DONE" => {
@@ -769,7 +788,8 @@ fn index_transcript_file(
                     }
                 }
             }
-            "GENERIC" => {
+            "GENERIC" | "RUN_COMMAND" | "VIEW_FILE" | "LIST_DIRECTORY" | "GREP_SEARCH"
+            | "SEARCH_WEB" | "CODE_ACTION" => {
                 let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
@@ -786,7 +806,7 @@ fn index_transcript_file(
                         turn_id,
                         role: "tool".to_string(),
                         text: trimmed.to_string(),
-                        tool_name: None,
+                        tool_name: (kind != "GENERIC").then(|| kind.to_lowercase()),
                         tool_input: None,
                         tool_output: Some(trimmed.to_string()),
                         links,
@@ -866,17 +886,9 @@ pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
         return None;
     }
     if (is_transcript_path(path) || is_overview_path(path))
-        && let Ok(file) = std::fs::File::open(path)
+        && let Ok(text) = std::fs::read_to_string(path)
     {
-        use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(file);
-        for line in reader.lines().take(100).flatten() {
-            if let Ok(val) = serde_json::from_str::<Value>(&line)
-                && let Some(cwd) = extract_cwd_from_json(&val)
-            {
-                return Some(cwd);
-            }
-        }
+        return cwd_from_lines(text.lines());
     }
     None
 }
@@ -1569,6 +1581,136 @@ mod tests {
         assert_eq!(
             session_id_from_brain_path(path),
             "e2a4562b-5476-4222-84bf-5110195946bf"
+        );
+    }
+
+    #[test]
+    fn captured_format_typed_results_preserve_output_and_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("brain/session/.system_generated/logs/transcript.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            include_str!("../../tests/fixtures/antigravity/transcript.jsonl"),
+        )
+        .unwrap();
+        let (records, output) = emit_collect(&path, false);
+        assert_eq!(records.len(), 13);
+        assert_eq!(output.session_cwd.as_deref(), Some("/repo"));
+        for (index, name) in [
+            "run_command",
+            "view_file",
+            "list_directory",
+            "grep_search",
+            "search_web",
+            "code_action",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let call = &records[1 + index * 2];
+            let result = &records[2 + index * 2];
+            assert_eq!(call.role, "tool_use");
+            assert_eq!(result.role, "tool");
+            assert_eq!(result.tool_name.as_deref(), Some(*name));
+            assert!(
+                result
+                    .tool_output
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+            );
+        }
+        assert_eq!(
+            records[2].tool_output.as_deref(),
+            Some("/repo\nExit code: 0")
+        );
+        assert!(records[8].text.contains("Antigravity truncated fields"));
+        let metadata: Value =
+            serde_json::from_str(records[8].links.source_content.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["truncated_fields"], serde_json::json!(["content"]));
+    }
+
+    #[test]
+    fn full_transcript_wins_and_retains_full_only_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("ANTIGRAVITY_HOME", Some(temp.path().to_str().unwrap()))]);
+        let logs = temp
+            .path()
+            .join("antigravity-cli/brain/session/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            r#"{"type":"GREP_SEARCH","content":"clipped","truncated_fields":["content"]}"#,
+        )
+        .unwrap();
+        let full = logs.join("transcript_full.jsonl");
+        fs::write(
+            &full,
+            r#"{"type":"GREP_SEARCH","content":"full-only-searchable-sentinel"}"#,
+        )
+        .unwrap();
+        let files = discover();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, full);
+        assert!(matches_path(full.to_str().unwrap()));
+        let (records, _) = emit_collect(&files[0].path, false);
+        assert_eq!(records[0].text, "full-only-searchable-sentinel");
+        assert!(records[0].links.source_content.is_none());
+    }
+
+    #[test]
+    fn cwd_ignores_search_targets_and_prefers_later_explicit_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transcript.jsonl");
+        fs::write(&path, r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"grep_search","args":{"SearchPath":"/repo/src/main.rs"}}]}
+{"type":"SYSTEM_MESSAGE","content":"[URI] -> [CorpusName]:\nfile:///fallback%20repo -> fallback"}
+{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{"Cwd":"file:///my%20repo"}}]}"#).unwrap();
+        let (records, output) = emit_collect(&path, false);
+        assert_eq!(output.session_cwd.as_deref(), Some("/my repo"));
+        assert!(records.iter().all(|record| record.project == "my repo"));
+        assert_eq!(session_cwd(&path), Some(PathBuf::from("/my repo")));
+        assert_eq!(
+            cwd_from_lines(
+                [r#"{"content":"[URI] -> [CorpusName]:\nfile:///fallback%20repo -> fallback"}"#]
+                    .into_iter()
+            ),
+            Some(PathBuf::from("/fallback repo"))
+        );
+        assert_eq!(cwd_from_lines([r#"{"tool_calls":[{"args":{"SearchPath":"/repo/src/main.rs","DirectoryPath":"/repo/src"}}]}"#].into_iter()), None);
+    }
+
+    #[test]
+    fn overview_resume_uses_conversation_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("brain/e2a4562b-5476-4222-84bf-5110195946bf/.system_generated/logs/overview.txt");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"USER_INPUT","status":"DONE","content":"hello"}"#,
+        )
+        .unwrap();
+        let (records, output) = emit_collect(&path, false);
+        let record = &records[0];
+        assert_eq!(
+            output.session_id.as_deref(),
+            Some("e2a4562b-5476-4222-84bf-5110195946bf")
+        );
+        let session = crate::resume::ResumeSession {
+            source: SourceKind::Antigravity,
+            session_id: &record.session_id,
+            project: &record.project,
+            source_path: &record.source_path,
+            source_dir: path.parent().unwrap().to_str().unwrap(),
+        };
+        let template = crate::resume::default_resume_template("antigravity", true).unwrap();
+        assert_eq!(
+            crate::resume::expand_resume_template(&template, &session, "/repo"),
+            "cd '/repo' && agy --conversation e2a4562b-5476-4222-84bf-5110195946bf"
         );
     }
 }

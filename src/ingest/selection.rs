@@ -226,7 +226,9 @@ fn classify(root: &Root, path: &Path) -> Match {
                 && !name.ends_with("-wal.db")
                 && !name.ends_with("-shm.db")
                 && parts.get(1).is_some_and(|part| *part == "conversations"))
-                || ((name == "overview.txt" || name == "transcript.jsonl")
+                || ((name == "overview.txt"
+                    || name == "transcript.jsonl"
+                    || name == "transcript_full.jsonl")
                     && path.to_string_lossy().contains(".system_generated/logs/"))
             {
                 Some(SourceKind::Antigravity)
@@ -524,6 +526,11 @@ mod tests {
             (
                 Shape::Antigravity,
                 "antigravity-cli/brain/comp/.system_generated/logs/transcript.jsonl",
+                SourceKind::Antigravity,
+            ),
+            (
+                Shape::Antigravity,
+                "antigravity-cli/brain/comp/.system_generated/logs/transcript_full.jsonl",
                 SourceKind::Antigravity,
             ),
         ];

@@ -166,6 +166,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_bob {
         roots.extend(crate::sources::bob::roots());
     }
+    if options.include_zcode {
+        roots.extend(crate::sources::zcode::db_dirs());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -795,6 +798,7 @@ mod tests {
             include_muse: true,
             include_antigravity: true,
             include_bob: true,
+            include_zcode: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -908,6 +912,7 @@ mod tests {
         options.include_muse = false;
         options.include_antigravity = false;
         options.include_bob = false;
+        options.include_zcode = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }

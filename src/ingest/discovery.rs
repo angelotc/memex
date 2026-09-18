@@ -72,6 +72,9 @@ pub(super) fn discover_transcripts(
     if options.include_antigravity && full_scan {
         files.extend(crate::sources::antigravity::discover());
     }
+    if options.include_zcode && full_scan {
+        files.extend(crate::sources::zcode::discover());
+    }
 
     // A watcher hint names the file that changed, not necessarily the projection
     // that owns its conversation. Resolve ownership here for both scan modes.
@@ -313,6 +316,15 @@ fn journal_hints(
                         .filter(|database| database.is_file()),
                 );
             }
+            // The zcode store is in the same position: WAL-only commits leave no
+            // checkpoint to sweep from until the first full index sees it.
+            if options.include_zcode {
+                paths.extend(
+                    crate::sources::zcode::db_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -458,7 +470,9 @@ pub(super) fn prepare_file_task(
         .filter(|previous| unchanged_file_metadata(previous, metadata, parser_version))
         .map(|previous| previous.identity.clone())
         .unwrap_or_else(|| file_identity(&path, metadata, prefix_bytes));
-    if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path) {
+    if (source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path))
+        || source == SourceKind::Zcode
+    {
         identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
     }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);

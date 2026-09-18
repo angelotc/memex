@@ -29,11 +29,9 @@ Bob tasks are read from `~/.bob/db/bob.db` (override with `MEMEX_BOB_DB`, a comm
 list of database paths with any file name, `~/` expanded); each task is indexed under the
 virtual source path `<db>/<task_id>`, and sub-agent runs embedded in a task appear as their own
 sessions. A database that cannot be read is skipped with a warning and its indexed tasks are kept.
-ZCode sessions are read from the session store at `~/.zcode/cli/db/db.sqlite`, which the
-desktop app's SSH-attached agent runtimes also write on remote hosts; point `ZCODE_HOME`
-(a comma-separated list of state roots, default `~/.zcode`) at extra roots — for example a
-synced copy of another machine's store — to index them alongside the live one. Subagent
-sessions link to their parent conversation.
+ZCode sessions are read from `~/.zcode/cli/db/db.sqlite`, the store its SSH-attached
+agent runtimes also write on remote hosts; `ZCODE_HOME` (comma-separated state roots)
+adds extra stores, such as a synced copy from another machine.
 
 ## Agent memories
 

@@ -78,10 +78,8 @@ tool. **Import into** creates a conversation in another tool using the
   comes from agent transcripts; its usage data comes from local databases.
   Antigravity reads available transcript, SQLite, and overview projections; it
   does not decrypt encrypted trajectories. Its token counters are not yet supported.
-  ZCode reads the session store at `~/.zcode/cli/db/db.sqlite`, written both by
-  local desktop workspaces and by SSH-attached remote agent runtimes; extra
-  stores can be indexed via a comma-separated `ZCODE_HOME`. ZCode sessions
-  resume inside the desktop app, not from the command line.
+  ZCode reads `~/.zcode/cli/db/db.sqlite`, which its SSH-attached runtimes also
+  write on remote hosts; `ZCODE_HOME` (comma-separated) indexes extra stores.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
   not subscription charges or quota balances. Hermes support reads usage counters
   and metadata only, not message content. Copilot usage requires local OpenTelemetry

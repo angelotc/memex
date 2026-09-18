@@ -37,8 +37,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Muse => config.muse_resume_cmd.clone(),
         SourceKind::Antigravity => config.antigravity_resume_cmd.clone(),
         SourceKind::Bob => config.bob_resume_cmd.clone(),
-        // ZCode sessions resume inside the desktop app; there is no CLI to hand
-        // the session id to.
+        // ZCode sessions resume in the desktop app, not a CLI.
         SourceKind::Zcode => None,
     };
     configured.or_else(|| default_resume_template(source.label(), remote))

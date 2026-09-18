@@ -242,7 +242,11 @@ fn classify(root: &Root, path: &Path) -> Match {
         Shape::Zcode => {
             // One store per db directory; `resolve` routes WAL and shared-memory
             // sidecar hints to the database before classification.
-            (parts.len() == 1 && name == "db.sqlite").then_some(SourceKind::Zcode)
+            return if parts.len() == 1 && name == "db.sqlite" {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
         }
         Shape::Antigravity => {
             let in_profile = parts.first().is_some_and(|part| {
@@ -376,6 +380,8 @@ fn resolve(
                     }
                     let source = if sources::bob::is_configured_database(&path) {
                         SourceKind::Bob
+                    } else if matches!(root.shape, Shape::Zcode) {
+                        SourceKind::Zcode
                     } else {
                         SourceKind::Opencode
                     };

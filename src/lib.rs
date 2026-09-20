@@ -31,6 +31,7 @@ pub mod vector;
 pub mod watch;
 pub mod web;
 pub mod web_auth;
+pub mod wiki_loop;
 
 #[cfg(test)]
 pub mod test_support;

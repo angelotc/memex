@@ -94,11 +94,13 @@ pub fn recent_sessions_for_project(
 
 /// Sessions whose last activity falls in `[since_ms, quiet_before_ms]` — i.e. ended (they
 /// have been quiet for at least the quiet window) and within the collector's lookback —
-/// oldest first, so the sweep drains history in the order it happened.
+/// with at least `min_message_count` turns, oldest first, so the sweep drains history in
+/// the order it happened and the limit counts only compilable sessions.
 pub fn ended_sessions_since(
     analytics_db: &Path,
     quiet_before_ms: i64,
     since_ms: i64,
+    min_message_count: i64,
     limit: usize,
 ) -> Result<Vec<SessionMeta>> {
     if !analytics_db.exists() {
@@ -114,11 +116,11 @@ pub fn ended_sessions_since(
         "SELECT source, session_id, source_path, project, cwd, git_root, repo_project,
                 started_at, last_at, message_count, resolution_status
          FROM sessions
-         WHERE last_at <= ? AND last_at >= ? AND message_count >= 1
+         WHERE last_at <= ? AND last_at >= ? AND message_count >= ?
          ORDER BY last_at ASC LIMIT ?",
     )?;
     let rows = stmt.query_map(
-        params![quiet_before_ms, since_ms, limit as i64],
+        params![quiet_before_ms, since_ms, min_message_count, limit as i64],
         map_session_row,
     )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

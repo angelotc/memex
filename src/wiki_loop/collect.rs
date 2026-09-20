@@ -28,17 +28,22 @@ pub fn sweep(cfg: &WikiLoopConfig, ledger: &StateLedger, queue: &QueueManager) -
     } else {
         0
     };
-    let sessions =
-        ingest::ended_sessions_since(&cfg.analytics_db(), quiet_before, since, SWEEP_LIMIT)?;
+    // The min_turns filter lives in the SQL so the discovery limit counts only
+    // compilable sessions — trivial ones must not eat sweep slots.
+    let sessions = ingest::ended_sessions_since(
+        &cfg.analytics_db(),
+        quiet_before,
+        since,
+        cfg.min_turns,
+        SWEEP_LIMIT,
+    )?;
 
     let mut enqueued = 0usize;
     for meta in sessions {
-        // Trivial sessions are skipped at claim time too; filtering here keeps them out
-        // of the queue entirely so `status` counts mean work, not noise.
-        if meta.message_count < cfg.min_turns {
+        if ledger.is_processed(&meta.source, &meta.session_id, meta.last_at) {
             continue;
         }
-        if ledger.is_processed(&meta.source, &meta.session_id, meta.last_at) {
+        if queue.is_dead_lettered(&meta.source, &meta.session_id) {
             continue;
         }
         queue.enqueue_event(

@@ -212,6 +212,11 @@ impl StateLedger {
         let mut rows = stmt.query(params![role])?;
         while let Some(row) = rows.next()? {
             let status: String = row.get(0)?;
+            // Dry runs are transparent to the breaker: they prove the prompt builds,
+            // nothing about the failing model call, and must not un-trip it.
+            if status == "dry" {
+                continue;
+            }
             if status == "ok" {
                 break;
             }
@@ -270,6 +275,22 @@ impl StateLedger {
             )
             .map(|n| n as u32)
             .context("counting proposals")
+    }
+
+    /// Open proposals (pending/validated), newest first — the `status` review surface,
+    /// so a missed notification does not mean `ls` on the state directory.
+    pub fn staged_proposals(&self, limit: i64) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, skill_name, status FROM proposals
+             WHERE status IN ('pending', 'validated')
+             ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // ---- deployment ----

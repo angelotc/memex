@@ -218,17 +218,23 @@ fn execute_maintainer(
     run_id: i64,
     dry_run: bool,
 ) -> Result<()> {
+    // Dry runs record under a status the circuit breaker ignores, and skip the
+    // collector sweep — "no model call, no write" must include queue files.
+    let ok_status = if dry_run { "dry" } else { "ok" };
+
     let queue = QueueManager::new(&cfg.queue_dir)?;
     // Collect first (paper step 1): sweep ended-but-uncompiled sessions from analytics
     // into the queue so the loop needs no per-harness hooks. Idempotent — sessions
     // already compiled through their current last_at are skipped.
-    let swept = super::collect::sweep(cfg, ledger, &queue)?;
-    if swept > 0 {
-        println!("collector swept {swept} ended session(s) into the queue");
+    if !dry_run {
+        let swept = super::collect::sweep(cfg, ledger, &queue)?;
+        if swept > 0 {
+            println!("collector swept {swept} ended session(s) into the queue");
+        }
     }
     let claimed = queue.claim(cfg.max_batch_size, cfg.quiet_minutes)?;
     if claimed.is_empty() {
-        ledger.finish_run(run_id, "ok", 0, 0, None)?;
+        ledger.finish_run(run_id, ok_status, 0, 0, None)?;
         println!("queue empty or no sessions cleared the quiet window");
         return Ok(());
     }
@@ -319,7 +325,7 @@ fn execute_maintainer(
     }
     let selected: Vec<&Candidate> = failing.iter().chain(passing.iter()).copied().collect();
     if selected.is_empty() {
-        ledger.finish_run(run_id, "ok", 0, 0, None)?;
+        ledger.finish_run(run_id, ok_status, 0, 0, None)?;
         println!("no new sessions to compile");
         return Ok(());
     }
@@ -355,7 +361,7 @@ fn execute_maintainer(
 
         if dry_run {
             let preview = prompt.chars().take(1200).collect::<String>();
-            ledger.finish_run(run_id, "ok", selected_total as i64, 0, None)?;
+            ledger.finish_run(run_id, ok_status, selected_total as i64, 0, None)?;
             println!("dry run: {selected_total} session(s) selected; queue left untouched");
             println!("--- prompt preview ---");
             println!("{preview}");
@@ -711,13 +717,24 @@ fn run_status(cfg: &WikiLoopConfig) -> Result<()> {
         println!("workspace:  {} (wiki + skills base)", root.display());
     }
     println!("skills:     {}", cfg.skills_root.display());
-    println!("proposals:  {}", cfg.proposals_dir.display());
     let week_ago = now_ms() - 7 * 24 * 3_600_000;
     println!(
-        "proposals:  {}/week used (ceiling {})",
+        "proposals:  {}/week used (ceiling {}), staged at {}",
         ledger.proposals_since(week_ago)?,
-        cfg.max_proposals_per_week
+        cfg.max_proposals_per_week,
+        cfg.proposals_dir.display()
     );
+    // The review surface: a missed notification must not mean `ls` on a state dir.
+    let staged = ledger.staged_proposals(10)?;
+    if staged.is_empty() {
+        println!("staged:     (no open proposals)");
+    } else {
+        println!("staged:");
+        for (id, skill_name, status) in staged {
+            println!("  {id} {status:<9} {skill_name}");
+        }
+        println!("  review with: memex wiki-loop validate <id> && memex wiki-loop apply <id>");
+    }
     let failures = ledger.consecutive_failures("maintainer")?;
     if failures > 0 {
         println!("health:     {failures} consecutive maintainer failure(s)");
@@ -831,6 +848,22 @@ fn run_init(workspace: Option<PathBuf>, force: bool, install_cron: bool) -> Resu
     let config_path = super::config::default_config_path()?;
     if config_path.exists() && !force {
         println!("[ok] config already present: {}", config_path.display());
+        // A requested workspace that an existing config does not carry is silently
+        // dropped — say so loudly instead of letting the wiki land somewhere else.
+        if let Some(w) = &workspace {
+            let existing = WikiLoopConfig::load(None)?;
+            if existing.workspace_root.as_deref() != Some(w.as_path()) {
+                println!(
+                    "[note] --workspace {} ignored: the existing config does not set it \
+                     (wiki stays at {}). Add `workspace_root = \"{}\"` to {} or re-run \
+                     with --force.",
+                    w.display(),
+                    existing.wiki_root.display(),
+                    w.display(),
+                    config_path.display()
+                );
+            }
+        }
     } else {
         let workspace_line = workspace
             .as_ref()
@@ -848,7 +881,8 @@ fn run_init(workspace: Option<PathBuf>, force: bool, install_cron: bool) -> Resu
              # max_failing_sessions   = 5     # paper Appendix C stratification\n\
              # max_passing_sessions   = 3\n\
              # max_proposals_per_week = 3     # precision over recall\n\n\
-             # Roles default to `agy`; see docs for a claude example:\n\
+             # Roles: the maintainer defaults to `agy`; the proposer and judge default to\n\
+             # `claude` (opus). See docs for full examples:\n\
              # [maintainer]\n\
              # command = [\"agy\", \"--output-format\", \"json\", \"--model\", \"{{model}}\", \"--effort\", \"{{effort}}\"]\n\
              # model = \"gemini-3.8-flash\"\n\
@@ -865,6 +899,10 @@ fn run_init(workspace: Option<PathBuf>, force: bool, install_cron: bool) -> Resu
 
     let cfg = WikiLoopConfig::load(None)?;
     for dir in [&cfg.wiki_root, &cfg.skills_root] {
+        if dir.exists() {
+            println!("[ok] present: {}", dir.display());
+            continue;
+        }
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         println!("[ok] created: {}", dir.display());
     }
@@ -875,8 +913,8 @@ fn run_init(workspace: Option<PathBuf>, force: bool, install_cron: bool) -> Resu
 
     println!("\nnext steps:");
     println!("  memex wiki-loop run-maintainer   # compile ended sessions now");
-    println!("  memex wiki-loop status           # queue, wiki, health");
-    println!("  memex tui, then `w`              # browse the wiki and skills");
+    println!("  memex wiki-loop status           # queue, wiki, staged skills, health");
+    println!("  memex tui, then alt+w            # wiki browser; `s` from there for skills");
     run_doctor(&cfg)
 }
 
@@ -906,7 +944,7 @@ fn install_cron_schedule(cfg: &WikiLoopConfig) -> Result<()> {
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default();
-    let merged = splice_cron_block(&existing, &block);
+    let merged = splice_cron_block(&existing, &block)?;
     let mut child = std::process::Command::new("crontab")
         .arg("-")
         .stdin(std::process::Stdio::piped())
@@ -929,25 +967,42 @@ fn install_cron_schedule(cfg: &WikiLoopConfig) -> Result<()> {
 }
 
 /// Replace the existing marked block (whole lines between the BEGIN/END markers,
-/// inclusive) or append a fresh one after the current crontab. Idempotent.
-fn splice_cron_block(existing: &str, block: &str) -> String {
+/// inclusive) or append a fresh one after the current crontab. Idempotent. Refuses
+/// malformed marker layouts (a BEGIN without its END, duplicated markers): splicing
+/// those could swallow unrelated user entries, so the caller is told to fix them.
+fn splice_cron_block(existing: &str, block: &str) -> Result<String> {
     const BEGIN: &str = "# BEGIN memex wiki-loop";
     const END: &str = "# END memex wiki-loop";
-    let begin_idx = existing.lines().position(|l| l.starts_with(BEGIN));
-    let end_idx = existing.lines().position(|l| l.starts_with(END));
-    if let (Some(begin), Some(end)) = (begin_idx, end_idx)
-        && begin < end
-    {
-        let mut out: Vec<&str> = existing.lines().collect();
-        out.splice(begin..=end, [block.trim_end()]);
-        out.join("\n") + "\n"
-    } else {
-        let trimmed = existing.trim_end();
-        if trimmed.is_empty() {
-            block.to_string()
-        } else {
-            format!("{trimmed}\n\n{block}")
+    let begins = existing
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| l.starts_with(BEGIN).then_some(i))
+        .collect::<Vec<_>>();
+    let ends = existing
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| l.starts_with(END).then_some(i))
+        .collect::<Vec<_>>();
+    match (begins.as_slice(), ends.as_slice()) {
+        ([], []) => {
+            let trimmed = existing.trim_end();
+            if trimmed.is_empty() {
+                Ok(block.to_string())
+            } else {
+                Ok(format!("{trimmed}\n\n{block}"))
+            }
         }
+        ([begin], [end]) if begin < end => {
+            let mut out: Vec<&str> = existing.lines().collect();
+            out.splice(*begin..=*end, [block.trim_end()]);
+            Ok(out.join("\n") + "\n")
+        }
+        _ => bail!(
+            "crontab has malformed wiki-loop markers ({} BEGIN, {} END); fix or remove \
+             them by hand and re-run `init --install-cron`",
+            begins.len(),
+            ends.len()
+        ),
     }
 }
 
@@ -959,23 +1014,23 @@ mod tests {
 
     #[test]
     fn splice_appends_to_unmarked_crontab_and_starts_fresh() {
-        let merged = splice_cron_block("0 5 * * * backup\n", BLOCK);
+        let merged = splice_cron_block("0 5 * * * backup\n", BLOCK).expect("splice");
         assert!(merged.starts_with("0 5 * * * backup\n\n# BEGIN memex wiki-loop"));
         assert!(merged.ends_with("# END memex wiki-loop\n"));
         // The other entries survive untouched.
         assert!(merged.contains("0 5 * * * backup"));
 
-        let fresh = splice_cron_block("", BLOCK);
+        let fresh = splice_cron_block("", BLOCK).expect("splice");
         assert_eq!(fresh, BLOCK);
 
         // Only-noise input (crontab -l failure fallback) is treated as empty.
-        assert_eq!(splice_cron_block("\n", BLOCK), BLOCK);
+        assert_eq!(splice_cron_block("\n", BLOCK).expect("splice"), BLOCK);
     }
 
     #[test]
     fn splice_replaces_existing_block_in_place_and_exactly_once() {
         let with_old = "0 5 * * * backup\n# BEGIN memex wiki-loop (old)\nold line\n# END memex wiki-loop\n9 9 * * * other\n";
-        let merged = splice_cron_block(with_old, BLOCK);
+        let merged = splice_cron_block(with_old, BLOCK).expect("splice");
         assert!(!merged.contains("old line"), "{}", merged);
         assert!(!merged.contains("(old)"));
         assert_eq!(merged.matches("# BEGIN memex wiki-loop").count(), 1);
@@ -986,5 +1041,21 @@ mod tests {
             "{}",
             merged
         );
+    }
+
+    #[test]
+    fn splice_refuses_malformed_markers_instead_of_swallowing_lines() {
+        // BEGIN without END (truncated manual edit): splicing would eat everything
+        // after BEGIN up to a later END — refuse.
+        let orphan_begin = "0 5 * * * backup\n# BEGIN memex wiki-loop\nold line\n";
+        let err = splice_cron_block(orphan_begin, BLOCK).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+
+        // Duplicated markers (an earlier append created two blocks): also refuse.
+        let doubled = format!("{BLOCK}0 0 * * * mine\n{BLOCK}");
+        let err = splice_cron_block(&doubled, BLOCK).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+        // Nothing is silently produced.
+        assert!(splice_cron_block(&doubled, BLOCK).is_err());
     }
 }

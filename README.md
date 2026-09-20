@@ -212,7 +212,8 @@ memex wiki-loop status                                  # queue, wiki growth, he
 One wiki and one skills directory back every project under the workspace root
 (`/apps/wiki`, `/apps/skills`); patterns and proposals carry `project:<name>` scope
 stamps, and cross-project evidence widens a proposal to global only under the strictest
-gates. Browse the compiled wiki and deployed skills read-only from the TUI with `w`.
+gates. Browse the compiled wiki from the TUI with `alt+w`, and the deployed skills with
+`s` from there.
 See [the wiki-loop guide](docs/wiki-loop.md) for the loop, its deliberate divergences
 from the paper, and operations.
 

@@ -2748,6 +2748,40 @@ impl App {
         }
     }
 
+    // Reload whichever browser is on screen, keeping the selection when the entry
+    // still exists (a maintainer cron may have added pages while it was open).
+    fn refresh_active_browser(&mut self) {
+        // Restore the selection (clamped) and pane focus afterwards —
+        // populate_browser resets both, which is right for entering the screen
+        // but jarring for a refresh key.
+        let (selected, focus) = match self.layout_mode {
+            LayoutMode::Wiki => (self.wiki.list.selected(), self.wiki.focus),
+            LayoutMode::Skills => (self.skills.list.selected(), self.skills.focus),
+            _ => return,
+        };
+        let len = match self.layout_mode {
+            LayoutMode::Wiki => {
+                populate_browser(&mut self.wiki, load_wiki_entries, wiki_empty_note);
+                self.wiki.entries.len()
+            }
+            LayoutMode::Skills => {
+                populate_browser(&mut self.skills, load_skill_entries, skills_empty_note);
+                self.skills.entries.len()
+            }
+            _ => return,
+        };
+        if let Some(browser) = self.active_browser() {
+            browser.focus = focus;
+            if len > 0 {
+                browser
+                    .list
+                    .select(Some(selected.unwrap_or(0).min(len - 1)));
+                browser.update_content();
+            }
+        }
+        self.set_status("refreshed");
+    }
+
     fn update_find(&mut self) {
         self.last_detail_session = None;
         self.update_detail();
@@ -3097,7 +3131,16 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                     app.move_project_selection(1);
                 }
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // alt+w opens the wiki from any text box (control chords excluded from
+            // typing below); other modifier chords are not text either.
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.enter_wiki();
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 match app.focus {
                     Focus::Query => app.query.push(ch),
                     Focus::Project => {
@@ -3141,7 +3184,14 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                     Focus::Preview
                 };
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.enter_wiki();
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 app.find_query.push(ch);
                 app.update_find();
             }
@@ -3388,7 +3438,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Backspace if app.query.pop().is_some() => {
                 app.schedule_home_search();
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 app.query.push(ch);
                 app.schedule_home_search();
             }
@@ -3488,6 +3542,11 @@ fn handle_browser_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         return Ok(false);
     };
     match key.code {
+        // Refresh: a maintainer cron may have written new pages while this screen
+        // was open (entries load on entry/hop, not continuously).
+        KeyCode::Char('r') => {
+            app.refresh_active_browser();
+        }
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
             browser.focus = match browser.focus {
                 Focus::List => Focus::Preview,
@@ -5603,6 +5662,10 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
         return Line::from(vec![
             Span::styled("s", theme.accent),
             Span::styled(" skills  ", theme.muted),
+            Span::styled("↑↓", theme.accent),
+            Span::styled(" move  ", theme.muted),
+            Span::styled("r", theme.accent),
+            Span::styled(" refresh  ", theme.muted),
             Span::styled("←→/tab", theme.accent),
             Span::styled(" pane  ", theme.muted),
             Span::styled("w/esc", theme.accent),
@@ -5614,6 +5677,10 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
         return Line::from(vec![
             Span::styled("w", theme.accent),
             Span::styled(" wiki  ", theme.muted),
+            Span::styled("↑↓", theme.accent),
+            Span::styled(" move  ", theme.muted),
+            Span::styled("r", theme.accent),
+            Span::styled(" refresh  ", theme.muted),
             Span::styled("←→/tab", theme.accent),
             Span::styled(" pane  ", theme.muted),
             Span::styled("s/esc", theme.accent),

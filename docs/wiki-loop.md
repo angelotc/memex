@@ -114,14 +114,15 @@ memex wiki-loop run-maintainer   # sweep + compile ended sessions
 memex wiki-loop status           # queue depth, wiki growth, health
 ```
 
-In the TUI, press `w` to browse the wiki and deployed skills read-only.
+In the TUI, press `alt+w` for the wiki browser (plain `w` once the results list has
+focus) and `s` from the wiki screen for deployed skills; both are read-only.
 
 ## Commands
 
 ```bash
 memex wiki-loop init [--workspace <dir>] [--install-cron] [--force]
 memex wiki-loop enqueue <source> <session_id> [--project <p>] [--ended]
-memex wiki-loop run-maintainer [--dry-run]
+memex wiki-loop run-maintainer [--dry-run] [--force]
 memex wiki-loop run-proposer [--dry-run]
 memex wiki-loop validate <proposal_id> [--skip-tier1]
 memex wiki-loop apply <proposal_id>
@@ -213,5 +214,5 @@ instead of burning model budget every tick.
   dead-lettered after five attempts rather than dropped.
 - **Wiki discovery.** memex only indexes memory markdown under a source's memory root
   (`~/.claude/projects/<project>/memory/**/*.md`); the wiki directory is **not** auto-indexed.
-  The TUI's wiki browser (below) reads it directly; symlink it into a memory root as well if
+  The TUI's wiki browser reads it directly (press `r` in it to refresh after a run); symlink it into a memory root as well if
   you also want full-text search over it.

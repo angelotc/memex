@@ -74,6 +74,19 @@ impl QueueManager {
         ))
     }
 
+    /// Whether a session has a dead-letter entry. The collector sweep consults this so
+    /// a poison session stays parked in the DLQ instead of being re-enqueued with a
+    /// fresh retry counter every cycle — the DLQ is the terminal, human-visible signal.
+    pub fn is_dead_lettered(&self, source: &str, session_id: &str) -> bool {
+        self.dlq_dir
+            .join(
+                self.entry_path(source, session_id)
+                    .file_name()
+                    .unwrap_or_default(),
+            )
+            .exists()
+    }
+
     /// Atomically enqueue or upsert a session event, stamping the event at the current
     /// time (hook calls; see `enqueue_event` for the collector's analytics-time stamp).
     pub fn enqueue(
@@ -148,9 +161,9 @@ impl QueueManager {
     }
 
     /// Claim up to `max_batch_size` sessions that have ended **and** cleared the quiet
-    /// window (paper step 9: sample a context-fit subset of completed traces).
-    /// Returns entries with a fingerprint of the on-disk bytes so `ack_if_unchanged`
-    /// can detect concurrent updates.
+    /// window, oldest activity first (paper step 9: sample a context-fit subset of
+    /// completed traces). Returns entries with a fingerprint of the on-disk bytes so
+    /// `ack_if_unchanged` can detect concurrent updates.
     pub fn claim(
         &self,
         max_batch_size: usize,
@@ -158,7 +171,8 @@ impl QueueManager {
     ) -> Result<Vec<(QueueEntry, u64)>> {
         let now = now_ms();
         let quiet_ms = quiet_minutes * 60 * 1000;
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.queue_dir)?
+        let mut eligible: Vec<QueueEntry> = Vec::new();
+        for path in std::fs::read_dir(&self.queue_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.extension().is_some_and(|e| e == "json")
@@ -166,14 +180,7 @@ impl QueueManager {
                         .file_name()
                         .is_some_and(|n| n.to_string_lossy().starts_with('.'))
             })
-            .collect();
-        paths.sort();
-
-        let mut claimed = Vec::new();
-        for path in paths {
-            if claimed.len() >= max_batch_size {
-                break;
-            }
+        {
             let Some(entry) = self.read_entry(&path) else {
                 continue;
             };
@@ -184,10 +191,19 @@ impl QueueManager {
             if !entry.ended || now - entry.last_event_at < quiet_ms {
                 continue;
             }
-            let fingerprint = entry_fingerprint(&entry);
-            claimed.push((entry, fingerprint));
+            eligible.push(entry);
         }
-        Ok(claimed)
+        // Oldest activity first — filename order is arbitrary, and the drain order is
+        // user-visible in the wiki's evidence timeline.
+        eligible.sort_by_key(|e| e.last_event_at);
+        eligible.truncate(max_batch_size);
+        Ok(eligible
+            .into_iter()
+            .map(|e| {
+                let fp = entry_fingerprint(&e);
+                (e, fp)
+            })
+            .collect())
     }
 
     /// Delete the entry after successful processing, but only if it was not updated while

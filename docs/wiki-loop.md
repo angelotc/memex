@@ -10,24 +10,23 @@ staged skill updates. It implements the three-layer loop from
 | Layer | Where | Mutability |
 | --- | --- | --- |
 | **Raw** — execution traces | memex index + `~/.memex/state/analytics.sqlite` | read-only, immutable |
-| **Wiki** — compounding knowledge | `~/.memex/wiki/` (global) and `~/.memex/wiki/projects/<name>/` (per project): `patterns/*.md`, `index.md`, `logs.md`, `skill-impact.md` | append and patch; **never rolled back** |
-| **Skills** — procedural instructions | `~/.agents/skills/<name>/` (global) and `<projects_root>/<project>/.claude/skills/<name>/` (per project) | versioned, rollback-able |
+| **Wiki** — compounding knowledge | one shared wiki (default `~/.memex/wiki/`, or `<workspace_root>/wiki/`): `patterns/*.md`, `index.md`, `logs.md`, `skill-impact.md` | append and patch; **never rolled back** |
+| **Skills** — procedural instructions | one shared skills root (default `~/.agents/skills/`, or `<workspace_root>/skills/`) | versioned, rollback-able |
 
 memex itself is never written to. wiki-loop reads sessions from the analytics store and loads
 turn records through `SearchIndex::records_by_session_id`, falling back to re-parsing the raw
 transcript when the index lags ingest.
 
-## Per-project stores
+## Workspace root
 
-Set `projects_root` (e.g. `/apps`) and wiki-loop partitions the loop per project found under
-it. Sessions resolve to a project via their `git_root`/`cwd` falling under the root (fallback:
-a `repo_project` whose directory exists under the root). Each project gets its own wiki
-(`~/.memex/wiki/projects/<name>/`) and its own skills directory
-(`<projects_root>/<name>/.claude/skills/`), so knowledge compounds per repo the way the
-paper's wiki compounds per benchmark — lessons from one codebase never surface in another.
-Sessions that resolve to no project land in the global store at `~/.memex/wiki/`, and
-global-scope skills still deploy to `~/.agents/skills/`. With `projects_root` unset, the
-entire loop uses the global store.
+Set `workspace_root` (e.g. `/apps`) and the wiki and skills base defaults become
+`<root>/wiki` and `<root>/skills` — one shared knowledge base covering every project
+under the root. There are no per-project stores: attribution travels in `project:<name>`
+scope stamps on patterns and proposals, and cross-project evidence is exactly what the
+fail-closed gates are for (a proposal whose motivating patterns span projects widens to
+`global`, where referenced paths and judge evidence must resolve across every
+contributing repo). Explicit `wiki_root` / `skills_root` keys still override the
+workspace defaults; with neither set, the loop uses `~/.memex/wiki` and `~/.agents/skills`.
 
 ## Loop order
 
@@ -38,11 +37,11 @@ The stages follow the paper's Algorithm 1:
    cleared the quiet window, stratified per Appendix C into up to **5 failing** traces
    (root-cause analysis) and up to **3 passing** traces (successful-strategy extraction,
    regression prevention), oldest first. Overflow sessions stay queued for the next run.
-3. **Maintain** — per project, the Wiki Maintainer sees the **full text of existing pattern
-   pages** plus the stratified digest, consolidates failure *and* success patterns, revises
+3. **Maintain** — the Wiki Maintainer sees the **full text of existing pattern pages**
+   plus the stratified digest, consolidates failure *and* success patterns, revises
    `index.md`, and appends to `logs.md`. Merges preserve prior sections the model leaves
    empty, union corroboration, and append evidence.
-4. **Propose** — per project wiki, the Skill Proposer reads the wiki index and the
+4. **Propose** — the Skill Proposer reads the wiki index and the
    `skill-impact.md` audit trail **first** (so rejected interventions are never re-proposed),
    then corroborated patterns and active skills, and emits at most one **atomic** single-skill
    proposal. A global weekly ceiling bounds proposal fatigue.
@@ -84,9 +83,11 @@ validation gate. Production traces are untrusted and real tasks are not replayab
   is unredacted, because the model must see the failure — run the roles against providers you
   are comfortable sending trace content to.
 - **Scope stamping.** memex is multi-project; every pattern and skill carries `project:<name>`
-  or `global` so lessons from one repo do not surface in another. Global-scope proposals get
-  the strictest gating (their referenced paths and judge evidence resolve across all
-  contributing projects, failing closed when they cannot).
+  or `global` so a lesson states where it applies even inside the shared wiki. Diverging
+  evidence widens a proposal to `global`, which gets the strictest gating: referenced paths
+  and judge evidence must resolve across every contributing project, failing closed when
+  they cannot. (The paper's wiki compounds per benchmark; this loop compounds across all
+  projects under the workspace root, with scopes as the attribution layer.)
 
 ## Commands
 
@@ -101,9 +102,9 @@ memex wiki-loop status
 memex wiki-loop doctor
 ```
 
-The maintainer writes the live wiki directly (per-project stores, the global store for
-unresolved sessions). There is no staging split: the wiki is append-only by construction and
-the human gate sits at skill delivery, where mistakes are reversible.
+The maintainer writes the live wiki directly. There is no staging split: the wiki is
+append-only by construction and the human gate sits at skill delivery, where mistakes are
+reversible.
 
 ## Configuration
 
@@ -111,10 +112,9 @@ Optional, at `~/.memex/wiki-loop.toml`. Defaults apply when the file is absent.
 
 ```toml
 # Paths
-wiki_root            = "~/.memex/wiki"
-skills_root          = "~/.agents/skills"       # global-scope skills land here
-projects_root        = "/apps"                  # optional: per-project wikis + skills
-project_skills_subdir = ".claude/skills"        # per-project skills dir, relative to each project
+workspace_root       = "/apps"                  # optional: wiki + skills base (→ /apps/wiki, /apps/skills)
+wiki_root            = "~/.memex/wiki"          # default without workspace_root; explicit key always wins
+skills_root          = "~/.agents/skills"       # default without workspace_root; explicit key always wins
 queue_dir            = "~/.local/state/wiki-loop/queue"
 state_db             = "~/.local/state/wiki-loop/state.db"
 proposals_dir        = "~/.local/state/wiki-loop/proposals"
@@ -180,5 +180,6 @@ instead of burning model budget every tick.
   fewer records than the session's message count, is retried with exponential backoff and
   dead-lettered after five attempts rather than dropped.
 - **Wiki discovery.** memex only indexes memory markdown under a source's memory root
-  (`~/.claude/projects/<project>/memory/**/*.md`); `~/.memex/wiki` is **not** auto-indexed.
-  Symlink it into a memory root if you want the wiki searchable from the TUI.
+  (`~/.claude/projects/<project>/memory/**/*.md`); the wiki directory is **not** auto-indexed.
+  The TUI's wiki browser (below) reads it directly; symlink it into a memory root as well if
+  you also want full-text search over it.

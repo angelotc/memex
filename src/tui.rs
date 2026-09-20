@@ -3377,6 +3377,13 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Backspace if app.query.pop().is_some() => {
                 app.schedule_home_search();
             }
+            // The wiki jump also fires from the empty search box — the screen opens
+            // here, and `w` typing into nothing reads as a dead key. Mid-query `w`
+            // still types; to search for a word starting with w, type any leading
+            // character first (or `/` from the list).
+            KeyCode::Char('w') if app.query.is_empty() => {
+                app.enter_wiki();
+            }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.query.push(ch);
                 app.schedule_home_search();
@@ -5538,6 +5545,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
                 Span::styled(" sessions  ", theme.muted),
                 Span::styled("enter", theme.accent),
                 Span::styled(" open results  ", theme.muted),
+                Span::styled("w", theme.accent),
+                Span::styled(" wiki  ", theme.muted),
                 Span::styled("tab", theme.accent),
                 Span::styled(" browse", theme.muted),
             ]);

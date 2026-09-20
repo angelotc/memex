@@ -83,7 +83,9 @@ i want the root /apps to be the wiki and skilsl base."
       (defaults live in the binary), create wiki/skills dirs, install the marked cron
       block via `crontab -` (idempotent splice of its own BEGIN/END block), run doctor.
 - [x] README section + docs install section; Reference table row.
-- [ ] TUI wiki/skills browser (`w`) — in flight via subagent.
+- [x] TUI wiki/skills browser (`w`): two-pane reader over patterns (scope-stamped),
+      index/logs/skill-impact, and deployed skills; markdown via the existing preview
+      pipeline; mouse + narrow-stack layout; 4 new tests (subagent implementation).
 
 ## Review
 
@@ -106,9 +108,16 @@ Operational notes:
 
 - Live deployment: `workspace_root = "/apps"` in `~/.memex/wiki-loop.toml`; wiki
   migrated from `~/.memex/wiki` to `/apps/wiki` (old dir kept as
-  `~/.memex/wiki.pre-apps-backup`); cron runs the static binary copy at
-  `/root/.local/bin/memex-wiki-loop` (refresh it after every rebuild); logs rotate
-  via `/etc/logrotate.d/wiki-loop`.
+  `~/.memex/wiki.pre-apps-backup`); cron installed via `wiki-loop init --install-cron`
+  (validated live: splices only its own marked block); logs rotate via
+  `/etc/logrotate.d/wiki-loop`. Refresh `/root/.local/bin/memex-wiki-loop` after every
+  rebuild — cron runs the static copy.
+- Collector live: first sweep enqueued 252 ended sessions (7-day lookback, 4 sources);
+  the queue drains 8 per run. One flaky maintainer parse failure (`missing field
+  patterns`) was retried successfully on the next run by design; parse errors now name
+  the received keys so the breaker error is diagnosable from `status` alone.
+- Six commits pushed to origin/wiki-loop (1315e06 → 27001d4), all attribution-free;
+  1094 lib tests green, fmt + clippy clean throughout.
 - The first push of the branch was rejected by GitHub push protection: the scrub.rs
   test fixtures contained realistic Stripe-key-shaped literals. Fixed by assembling
   the fixtures via `concat!` (regexes still fully exercised) and collapsing the four

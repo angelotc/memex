@@ -3269,6 +3269,11 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         KeyCode::Char('w') if app.layout_mode != LayoutMode::Detail => {
             app.enter_wiki();
         }
+        // Same jump with the modifier chord, so one muscle memory works from the
+        // search box and the list alike (alt+w, per the home query handler).
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.enter_wiki();
+        }
         KeyCode::Char(' ')
             if app.layout_mode == LayoutMode::List && matches!(app.focus, Focus::List) =>
         {
@@ -3356,6 +3361,12 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
 
     if matches!(app.focus, Focus::Query) {
         match key.code {
+            // Alt+W opens the wiki even while typing: modifier chords are never
+            // query text, so the jump can share no letters with the search box.
+            // (Alt, not Ctrl — ctrl-w is close-tab muscle memory in browsers.)
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.enter_wiki();
+            }
             KeyCode::Esc if !app.query.is_empty() => {
                 app.query.clear();
                 app.schedule_home_search();
@@ -3376,13 +3387,6 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             }
             KeyCode::Backspace if app.query.pop().is_some() => {
                 app.schedule_home_search();
-            }
-            // The wiki jump also fires from the empty search box — the screen opens
-            // here, and `w` typing into nothing reads as a dead key. Mid-query `w`
-            // still types; to search for a word starting with w, type any leading
-            // character first (or `/` from the list).
-            KeyCode::Char('w') if app.query.is_empty() => {
-                app.enter_wiki();
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.query.push(ch);
@@ -5545,7 +5549,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
                 Span::styled(" sessions  ", theme.muted),
                 Span::styled("enter", theme.accent),
                 Span::styled(" open results  ", theme.muted),
-                Span::styled("w", theme.accent),
+                Span::styled("alt+w", theme.accent),
                 Span::styled(" wiki  ", theme.muted),
                 Span::styled("tab", theme.accent),
                 Span::styled(" browse", theme.muted),

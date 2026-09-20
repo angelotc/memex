@@ -380,7 +380,16 @@ fn execute_maintainer(
             summary: String,
         }
         let output: MaintainerOutput =
-            serde_json::from_value(value).context("parsing maintainer JSON output")?;
+            serde_json::from_value(value.clone()).with_context(|| {
+                // Malformed-output failures recur flakily with frontier models; naming
+                // the keys we actually got (an unwrapped envelope shows up here) makes
+                // the circuit-breaker error diagnosable from `status` alone.
+                let keys = value
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                format!("parsing maintainer JSON output (keys: {keys:?})")
+            })?;
         if output.patterns.is_empty() && output.summary.trim().is_empty() {
             bail!(
                 "maintainer produced no structured output (0 patterns, empty summary); \

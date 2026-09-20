@@ -1,6 +1,9 @@
 //! Skill Proposer (paper step 11): reads the wiki index and the skill-impact audit trail
 //! **first**, then corroborated pattern pages and active skills, and emits at most one
 //! atomic single-skill proposal as a staged directory + unified diff.
+//!
+//! One shared wiki backs every project under the workspace root, so one proposal
+//! opportunity per run; the weekly ceiling bounds the human's approval load.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -34,28 +37,25 @@ struct ExistingSkillSummary {
 
 pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -> Result<String> {
     // Weekly proposal ceiling: approval fatigue defeats the human gate.
-    let week_ago = now_ms() - 7 * 24 * 3_600_000;
-    let made = ledger.proposals_since(week_ago)?;
-    if made >= cfg.max_proposals_per_week {
+    if !dry_run
+        && ledger.proposals_since(now_ms() - 7 * 24 * 3_600_000)? >= cfg.max_proposals_per_week
+    {
         return Ok(format!(
-            "proposal ceiling reached ({made}/week ≥ {}); skipping — quiet proposers are trusted proposers",
+            "proposal ceiling reached (≥ {}/week); proposer quiet until next week",
             cfg.max_proposals_per_week
         ));
     }
 
     // ---- Inputs, in the paper's order: index → skill-impact → corroborated patterns → skills.
 
-    let wiki_root = &cfg.wiki_root;
-    if !wiki_root.exists() {
-        bail!(
-            "wiki root {} does not exist yet; run `wiki-loop run-maintainer` first",
-            wiki_root.display()
-        );
+    if !cfg.wiki_root.exists() {
+        return Ok("nothing to propose: the wiki does not exist yet".into());
     }
-    let index_md = std::fs::read_to_string(wiki_root.join("index.md")).unwrap_or_default();
-    let impact_md = std::fs::read_to_string(wiki_root.join("skill-impact.md")).unwrap_or_default();
+    let index_md = std::fs::read_to_string(cfg.wiki_root.join("index.md")).unwrap_or_default();
+    let impact_md =
+        std::fs::read_to_string(cfg.wiki_root.join("skill-impact.md")).unwrap_or_default();
 
-    let store = super::patterns::PatternStore::new(wiki_root)?;
+    let store = super::patterns::PatternStore::new(&cfg.wiki_root)?;
     let mut candidates: Vec<String> = Vec::new();
     let mut candidate_scopes: Vec<String> = Vec::new();
     for (_, (path, meta)) in store.catalog()? {
@@ -80,7 +80,7 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
     }
     if candidates.is_empty() {
         return Ok(format!(
-            "no patterns with ≥{} corroborating sessions yet; nothing to propose",
+            "nothing to propose: no patterns with ≥{} corroborating sessions yet",
             cfg.min_pattern_corroboration
         ));
     }
@@ -90,19 +90,13 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
         pattern_block.push_str("\n... [patterns truncated]");
     }
 
+    // ---- Scope for a new proposal: the unanimous scope of the motivating patterns.
+    // Diverging evidence widens to `global` — which is exactly when the fail-closed
+    // Tier-0/Tier-1 gates get to veto it; it must not silently widen.
+    let scope = proposal_scope_for(&candidate_scopes);
+
     let skills = list_existing_skills(&cfg.skills_root)?;
     let skills_block = serde_json::to_string_pretty(&skills)?;
-
-    // ---- Scope for a new proposal: the shared scope of the motivating patterns.
-    let scope = if let Some(first) = candidate_scopes.first() {
-        if candidate_scopes.iter().all(|s| s == first) {
-            first.clone()
-        } else {
-            "global".to_string()
-        }
-    } else {
-        "global".to_string()
-    };
 
     let prompt = format!(
         "{}\n\n## 1. Wiki Index\n\n{}\n\n## 2. Skill-Impact Audit Trail\n\n{}\n\n## 3. Corroborated Pattern Pages\n\n{}\n\n## 4. Existing Active Skills\n\n{}",
@@ -122,10 +116,15 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
         ));
     }
 
+    let schema = if cfg.proposer.json_schema {
+        Some(cfg.schema_path("proposer", super::prompts::PROPOSER_SCHEMA)?)
+    } else {
+        None
+    };
     let raw = super::harness::run_role(
         &cfg.proposer,
         &prompt,
-        None,
+        schema.as_deref(),
         std::time::Duration::from_secs(cfg.subprocess_timeout_secs),
     )?;
     let value = super::harness::extract_json_object(&raw)?;
@@ -189,13 +188,20 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
     std::fs::write(dir.join("skill.diff"), &diff)?;
     ledger.insert_proposal(&id, &skill_name, &out.purpose_patterns)?;
 
-    // ---- Gate: Tier 0 always; Tier 1 counterfactual judge for project-scoped proposals.
+    // ---- Gate: Tier 0 always; Tier 1 counterfactual judge, fed the contributing
+    // pattern scopes so global-scope proposals replay evidence from every project
+    // that motivated them (and fail closed when none resolves).
+    let mut contributing_scopes = candidate_scopes.clone();
+    contributing_scopes.sort();
+    contributing_scopes.dedup();
+
     let tier0_results = super::gates::tier0(
         cfg,
         ledger,
         &proposal,
         &out.skill_markdown,
         existing_skill.as_deref(),
+        &contributing_scopes,
     )?;
     let mut all_passed = true;
     for (name, result) in &tier0_results {
@@ -203,7 +209,7 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
         all_passed &= result.passed;
     }
     if all_passed {
-        match super::gates::tier1(cfg, &proposal, &out.skill_markdown) {
+        match super::gates::tier1(cfg, &proposal, &out.skill_markdown, &contributing_scopes) {
             Ok(Some(result)) => {
                 all_passed &= result.passed;
                 proposal.gates.insert("tier1".into(), result);
@@ -260,6 +266,18 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
         "proposal {id} for `{skill_name}`: {} ({summary})\n  review with: memex wiki-loop validate {id} && memex wiki-loop apply {id}",
         proposal.status
     ))
+}
+
+/// Scope for a proposal: the unanimous scope of its motivating patterns when they agree;
+/// diverging evidence is cross-project by definition, so it widens to `global` — where
+/// the strictest gates apply — rather than pinning to whichever project sorted first.
+fn proposal_scope_for(candidate_scopes: &[String]) -> String {
+    if let Some(first) = candidate_scopes.first()
+        && candidate_scopes.iter().all(|s| s == first)
+    {
+        return first.clone();
+    }
+    "global".into()
 }
 
 fn summarize_gates(gates: &BTreeMap<String, GateResult>) -> String {
@@ -391,5 +409,26 @@ mod tests {
                 .expect("fm");
         assert_eq!(name, "my-skill");
         assert_eq!(desc, "Does things.");
+    }
+
+    #[test]
+    fn scope_selection() {
+        // Unanimous patterns keep their scope, project or global.
+        assert_eq!(
+            proposal_scope_for(&["project:memex".into(), "project:memex".into()]),
+            "project:memex"
+        );
+        assert_eq!(proposal_scope_for(&["global".into()]), "global");
+        // Diverging evidence is cross-project by definition: widen to global, where the
+        // strictest gates apply, instead of pinning whichever project sorted first.
+        assert_eq!(
+            proposal_scope_for(&["project:memex".into(), "global".into()]),
+            "global"
+        );
+        assert_eq!(
+            proposal_scope_for(&["project:a".into(), "project:b".into()]),
+            "global"
+        );
+        assert_eq!(proposal_scope_for(&[]), "global");
     }
 }

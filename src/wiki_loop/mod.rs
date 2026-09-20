@@ -31,9 +31,15 @@ mod proposer;
 mod queue;
 mod scrub;
 
-/// Prompt templates, embedded at compile time (house style: `include_str!`).
+/// Prompt templates and output schemas, embedded at compile time (house style:
+/// `include_str!`). Schemas are materialized to disk per run and passed to harnesses
+/// that support enforced JSON output (`RoleConfig::json_schema`).
 pub mod prompts {
     pub const MAINTAINER: &str = include_str!("prompts/maintainer.md");
     pub const PROPOSER: &str = include_str!("prompts/proposer.md");
     pub const JUDGE: &str = include_str!("prompts/judge.md");
+
+    pub const MAINTAINER_SCHEMA: &str = include_str!("prompts/schema-maintainer.json");
+    pub const PROPOSER_SCHEMA: &str = include_str!("prompts/schema-proposer.json");
+    pub const JUDGE_SCHEMA: &str = include_str!("prompts/schema-judge.json");
 }

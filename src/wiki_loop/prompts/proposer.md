@@ -9,7 +9,7 @@ Your mission: review the wiki index, the skill-impact audit trail, and corrobora
 4. **Existing Active Skills** — currently deployed SKILL.md files (name, description, content).
 
 ## Instructions
-1. Select the single highest-leverage procedural pattern: reusable, corroborated by multiple independent sessions, and not already covered by an active skill.
+1. Select the single highest-leverage procedural pattern: reusable, corroborated by multiple independent sessions, and not already covered by an active skill. Pattern pages carry a `kind`: `failure` patterns encode a workaround for a proven failure mode; `success` patterns encode a strategy that consistently worked — both are legitimate skill material, and a success strategy that prevents regressions is often the safer first proposal.
 2. Write the skill in the standard skills format:
    - YAML frontmatter with `name` (kebab-case) and `description` (one line; this is what progressive disclosure surfaces).
    - **When to use** — trigger conditions.

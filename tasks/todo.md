@@ -1,48 +1,101 @@
-# wiki-loop — Rust port into memex (branch: wiki-loop)
+# wiki-loop: implement glm-review fixes + per-project roots
 
-Extend memex with a `memex wiki-loop` subcommand implementing the WikiSkill
-(arXiv:2608.27454) three-layer loop in Rust. Fixes every deviation found reviewing the
-earlier Python prototype (/tmp/glm_review.md addendum).
+Review verdict (tasks/glm-review.md): accurate — all 22 findings verified against
+src/wiki_loop/ and the paper (arXiv:2608.27454, §3.2.2/§3.2.3/§3.2.4, Alg. 1, App. C,
+prompts E.2/E.3). Fix everything P0–P2 plus the cheap P3s, and add per-project
+wiki/skills stores under a configurable projects root.
 
-## Plan
+## Wave 1 — parallel subagents (disjoint files)
 
-- [x] 1. Recon memex internals (CLI plumbing, config/Paths, Record parsing, analytics read
-      API, flock precedent, house style)
-- [x] 2. Module skeleton: src/wiki_loop/{mod,cli,config,queue,digest,scrub,harness,patterns,
-      ledger,lock,notify,proposer,gates}.rs + prompts via include_str!
-- [x] 3. Config: ~/.memex/wiki-loop.toml, corrected paths (analytics.sqlite, wiki root,
-      staging), limits (budgets, timeout, max_proposals_per_week)
-- [x] 4. Queue: atomic upsert enqueue (ended defaults FALSE), claim = ended AND quiet,
-      nack/backoff/DLQ, ack-only-if-unchanged
-- [x] 5. Maintainer: in-process trace read (analytics RO + index + raw JSONL fallback),
-      error-turn digest w/ budgets, existing catalog, orchestrator-owned writes
-- [x] 6. Patterns: PATCH-BASED merge (union corroboration, keep created, preserve evidence),
-      index.md render, logs.md append per run, quarantine dir, superseded_by
-- [x] 7. Ledger: state.db (processed/runs/proposals/deployment/holdout), pattern_ids recorded
-- [x] 8. Proposer: inputs = index.md + skill-impact.md FIRST, then corroborated patterns +
-      skills; atomic single-skill proposal dir (proposal.json, SKILL.md, PURPOSE.md, skill.diff)
-- [x] 9. Gates: Tier 0 (secret rescan, name/scope, dedup, recently-rejected, referenced-path
-      existence) + Tier 1 counterfactual judge; apply/rollback write skill-impact.md;
-      wiki NEVER rolled back
-- [x] 10. notify (herdr notification show), flock role lock, status/doctor, circuit breaker
-- [x] 11. docs/wiki-loop.md
-- [ ] 12. Tests green; cargo fmt --check + clippy -D warnings
-- [ ] 13. Commit on wiki-loop branch
-- [ ] 14. GLM 5.3 herdr pane (ccs glm) thorough review vs paper; address findings
+- [x] A. scrub.rs — F19 secret shapes: Stripe (sk_/rk_/whsec_), unquoted env assigns,
+      JWTs, DB connection strings, AWS secret keys (label-gated), Slack webhooks,
+      `Authorization: Basic`. Tests per shape + FP sanity.
+- [x] B. harness.rs — F20 process-group kill (process_group(0) + kill(-pgid, SIGKILL)).
+- [x] C. patterns.rs + prompts/maintainer.md — F4 (create-on-existing-slug promotes to
+      merge; quarantine never clobbers), F11 (merge: empty section keeps prior text),
+      F18 (frontmatter sanitization: one-line title, scope validation), `kind:
+      failure|success` field (F10 substrate), F22 test fixes (slug-fork case).
+- [x] D. gates.rs + ledger.rs — F1 (proposal-id validator allowing `_`), F2 (apply
+      requires all tier-0 gates, not a nonexistent "tier0" key), F8 (v1 rollback
+      restores backup, no remove_dir_all), F9 (next version from MAX over all rows),
+      F15 (global-scope fails closed: refs checked against contributing projects, tier1
+      judges the union), F16 (judge assessments reconciled against digested sessions),
+      F21 (stale `running` runs marked error on open). New gates test module covering
+      validate → apply → rollback end to end.
 
-## Paper-fidelity checklist (Algorithm 1)
+## Wave 2 — core wiring (orchestrator)
 
-- [x] order: traces → sample → maintainer(W_{k-1}) → proposer → gate → apply/revert
-- [x] maintainer patches the wiki incrementally (create / merge / supersede), never overwrites
-- [x] maintainer revises index.md and appends logs.md each run
-- [x] proposer reads index + skill-impact.md first; never re-proposes a rejected intervention
-- [x] proposal is atomic: exactly one skill created or patched
-- [x] accept/reject decision appended to skill-impact.md programmatically
-- [x] wiki is never rolled back; only skills revert
+- [x] F3 — remove the staging/live split: maintainer writes the live wiki; drop
+      `--live` and `wiki_staging` config; fix docs cron.
+- [x] F5 — maintainer output: `patterns` required (no serde default); empty patterns +
+      empty summary = error, never ack.
+- [x] F6 — empty/partial index reads fall back to raw transcript, else nack (retry),
+      never silently "ok".
+- [x] F7 — ack before mark_processed; `compiled_last_event_at` column so resumed
+      sessions recompile their new turns.
+- [x] F10 — stratified sampling per paper App. C: ≤5 failing + ≤3 passing sessions per
+      run (FIFO); passing digests built for strategy extraction; success patterns.
+- [x] F11 — maintainer prompt receives full pattern page bodies (bounded), not a
+      one-line catalog.
+- [x] F13 — `validate` appends to skill-impact.md on status change.
+- [x] F14 — role locks: proposer takes "proposer" + shared "wiki" lock; maintainer
+      takes "maintainer" + "wiki"; validate/apply/rollback take "delivery".
+- [x] F17 — materialize embedded JSON schemas; pass schema_path where role.json_schema.
+- [x] F21 — written counts only successful ops; all-ops-fail run = error (breaker);
+      per-pattern provenance (session → patterns it actually evidenced).
+- [x] F22 — error markers matched against tool output only (not assistant prose);
+      char-consistent truncation.
+- [x] F12 — document the one-shot-proposer divergence in docs/wiki-loop.md.
 
-## Deliberate divergences from the paper (documented in docs/wiki-loop.md)
+## Per-project stores (user request)
 
-- human approval gate (paper is fully automatic) — traces are untrusted in production
-- Tier-1 counterfactual judge replaces validation rollouts — real tasks are not replayable
-- orchestrator owns all writes; agents emit JSON only — prompt-injection containment
-- secret scrubbing + quarantine; scope stamping — durable multi-project store
+- [x] `projects_root` config (e.g. /apps); sessions resolve to a project via
+      git_root/cwd under the root (fallback: repo_project dir exists).
+- [x] Wiki per project: `~/.memex/wiki/projects/<name>/`; unresolved sessions keep the
+      global store at `~/.memex/wiki/`. Maintainer groups its batch per project and
+      runs once per project group.
+- [x] Skills per project: applied skills land in
+      `<projects_root>/<project>/.claude/skills/` (configurable subdir); global-scope
+      skills still go to `~/.agents/skills`. Rollback resolves the dir from the
+      deployment's recorded scope.
+- [x] Proposer iterates project stores + global (weekly ceiling still global).
+- [x] status/doctor show per-project state.
+
+## Wave 3 — verify + ship
+
+- [x] cargo fmt --check, cargo clippy -- -D warnings, cargo test (all green;
+      CARGO_TARGET_DIR=/mnt/HC_Volume_106441424/caches/target, jobs capped at 2).
+- [x] docs/wiki-loop.md updated (cron without --live, per-project layout, new
+      divergences, unredacted-traces-to-models note).
+- [x] Commit (no attribution lines, per repo rule).
+
+## Review
+
+All 22 review findings addressed (F1–F22). Verification: `cargo fmt --check` clean,
+`cargo clippy --lib -- -D warnings` clean, `cargo test --lib` **1085 passed / 0
+failed** (wiki_loop suite grew 32 → 67 tests, including a new gates module covering
+validate → apply → rollback → re-apply end to end). Binary smoke-tested
+(`memex wiki-loop --help`).
+
+Bonus defects found and fixed beyond the review:
+
+1. **The maintainer prompt had no `{digest}` placeholder at all** — cli.rs's
+   `.replace("{digest}", …)` was a no-op, so the model never saw the catalog or the
+   trace digest. Every maintenance run ran blind. (Found by the patterns agent; now one
+   explicit placeholder + JSON-schema enforcement of the output shape.)
+2. `Record` is not `Clone`, so the per-project grouping initially cloned a `&Vec` by
+   accident — caught by compile, fixed by consuming the map.
+
+Operational notes:
+
+- To enable per-project stores, set `projects_root = "/apps"` in
+  `~/.memex/wiki-loop.toml`; skills then deploy to each project's
+  `.claude/skills/` (configurable via `project_skills_subdir`). Unset = previous
+  single-store behavior.
+- The cache volume filled (31G, 100%) during the final link; cleared
+  `target/debug/incremental` (8.3G) — rebuilds are slower once, nothing else affected.
+- Known accepted limitations, documented in docs/wiki-loop.md: the proposer remains
+  one-shot (no ReAct trace access — declared divergence), merges are section-level
+  rather than span-level, and the digest sent to the role models is unredacted by
+  design (scrubbing protects the durable files).
+

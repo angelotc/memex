@@ -19,6 +19,10 @@ pub struct Corroboration {
 pub struct PatternOp {
     /// "create" | "merge" | "supersede"
     pub action: String,
+    /// "failure" (default) | "success": failure modes from error traces, or
+    /// strategies extracted from passing traces.
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub existing_id: Option<String>,
     pub slug: String,
@@ -43,6 +47,8 @@ pub struct PatternMeta {
     pub id: String,
     pub title: String,
     pub status: String,
+    /// "failure" | "success"; pages written before the field existed parse as "failure".
+    pub kind: String,
     pub scope: String,
     pub created: String,
     pub updated: String,
@@ -94,6 +100,7 @@ impl PatternStore {
 
         let mut meta = PatternMeta {
             status: "candidate".into(),
+            kind: "failure".into(),
             scope: "global".into(),
             scrub_pass: "v1".into(),
             ..Default::default()
@@ -156,6 +163,7 @@ impl PatternStore {
                 "id" => meta.id = v.to_string(),
                 "title" => meta.title = v.to_string(),
                 "status" => meta.status = v.to_string(),
+                "kind" => meta.kind = normalize_kind(v).to_string(),
                 "scope" => meta.scope = v.to_string(),
                 "created" => meta.created = v.to_string(),
                 "updated" => meta.updated = v.to_string(),
@@ -184,8 +192,14 @@ impl PatternStore {
         let mut out = String::new();
         out.push_str("---\n");
         out.push_str(&format!("id: {}\n", meta.id));
-        out.push_str(&format!("title: \"{}\"\n", meta.title.replace('"', "'")));
+        // Free text is spliced into hand-rolled frontmatter, so it can never be
+        // allowed to start a new line (quote-escaping alone does not prevent that).
+        out.push_str(&format!(
+            "title: \"{}\"\n",
+            collapse_newlines(&meta.title).replace('"', "'")
+        ));
         out.push_str(&format!("status: {}\n", meta.status));
+        out.push_str(&format!("kind: {}\n", meta.kind));
         out.push_str(&format!("scope: {}\n", meta.scope));
         out.push_str(&format!("created: {}\n", meta.created));
         out.push_str(&format!("updated: {}\n", meta.updated));
@@ -200,9 +214,13 @@ impl PatternStore {
                 ));
             }
         }
+        let superseded_by = meta
+            .superseded_by
+            .as_deref()
+            .map(first_line)
+            .unwrap_or_else(|| "null".into());
         out.push_str(&format!(
-            "superseded_by: {}\nscrub_pass: {}\n---\n",
-            meta.superseded_by.as_deref().unwrap_or("null"),
+            "superseded_by: {superseded_by}\nscrub_pass: {}\n---\n",
             meta.scrub_pass
         ));
         out.push_str(&format!(
@@ -252,22 +270,48 @@ impl PatternStore {
         if !is_valid_slug(&op.slug) {
             bail!("invalid pattern slug `{}`", op.slug);
         }
+        // Downstream paths are built from the scrubbed copy; pin it to the validated
+        // slug so a divergence between the two can never reach the filesystem.
+        let mut scrubbed = scrubbed.clone();
+        scrubbed.slug = op.slug.clone();
         match op.action.as_str() {
-            "create" => self.create(scrubbed, evidence),
-            "merge" => self.merge(op, scrubbed, evidence),
-            "supersede" => self.supersede(op, scrubbed, evidence),
+            "create" => self.create(op, &scrubbed, evidence),
+            "merge" => self.merge(op, &scrubbed, evidence),
+            "supersede" => self.supersede(op, &scrubbed, evidence),
             other => bail!("unknown pattern action `{other}`"),
         }
     }
 
-    fn create(&self, scrubbed: &PatternOp, evidence: &[Corroboration]) -> Result<PatternWrite> {
+    fn create(
+        &self,
+        op: &PatternOp,
+        scrubbed: &PatternOp,
+        evidence: &[Corroboration],
+    ) -> Result<PatternWrite> {
+        // A create aimed at a slug that already has a page would clobber its
+        // accumulated corroboration with a brand-new id; promote it to a merge
+        // against the existing page instead (forks union, they never reset).
+        let target = self.patterns_dir().join(format!("{}.md", scrubbed.slug));
+        if target.exists() {
+            let content = std::fs::read_to_string(&target)?;
+            let Some((existing, _)) = Self::parse_frontmatter(&content) else {
+                bail!(
+                    "`{}` already exists but its frontmatter is unparseable; not overwriting",
+                    target.display()
+                );
+            };
+            let mut promoted = op.clone();
+            promoted.existing_id = Some(existing.id);
+            return self.merge(&promoted, scrubbed, evidence);
+        }
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let id = generate_pattern_id();
         let meta = PatternMeta {
             id: id.clone(),
             title: scrubbed.title.clone(),
             status: "candidate".into(),
-            scope: scrubbed.scope.clone().unwrap_or_else(|| "global".into()),
+            kind: normalize_kind(&scrubbed.kind).into(),
+            scope: sanitize_scope(scrubbed.scope.as_deref().unwrap_or("global"))?,
             created: now.clone(),
             updated: now,
             corroboration: evidence.to_vec(),
@@ -309,11 +353,14 @@ impl PatternStore {
 
         // Patch semantics: union corroboration, keep the original created timestamp and
         // identity, refresh the analysis sections, and *append* to the evidence history.
+        // An empty incoming section preserves the page's current text instead of
+        // blanking it: the maintainer refines sections, and must be able to leave
+        // one alone.
         let mut meta = existing.clone();
         meta.title = scrubbed.title.clone();
         meta.updated = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         if scrubbed.scope.is_some() {
-            meta.scope = scrubbed.scope.clone().unwrap();
+            meta.scope = sanitize_scope(scrubbed.scope.as_deref().unwrap())?;
         }
         for c in evidence {
             if !meta
@@ -326,7 +373,10 @@ impl PatternStore {
         }
 
         let existing_content = std::fs::read_to_string(&path)?;
-        let prior_evidence = existing_evidence_section(&existing_content);
+        let prior_symptom = existing_section(&existing_content, "Symptom");
+        let prior_root_cause = existing_section(&existing_content, "Root Cause");
+        let prior_fix = existing_section(&existing_content, "Fix");
+        let prior_evidence = existing_section(&existing_content, "Evidence");
         let mut summary = prior_evidence;
         if !summary.is_empty() {
             summary.push('\n');
@@ -335,9 +385,9 @@ impl PatternStore {
 
         let content = Self::render(
             &meta,
-            &scrubbed.symptom,
-            &scrubbed.root_cause,
-            &scrubbed.fix,
+            section_text(&scrubbed.symptom, &prior_symptom),
+            section_text(&scrubbed.root_cause, &prior_root_cause),
+            section_text(&scrubbed.fix, &prior_fix),
             &summary,
         );
         self.write_atomic(&path, &content)?;
@@ -396,7 +446,9 @@ impl PatternStore {
             id: generate_pattern_id(),
             title: scrubbed.title.clone(),
             status: "quarantined".into(),
-            scope: scrubbed.scope.clone().unwrap_or_else(|| "global".into()),
+            kind: normalize_kind(&scrubbed.kind).into(),
+            scope: sanitize_scope(scrubbed.scope.as_deref().unwrap_or("global"))
+                .unwrap_or_else(|_| "global".into()),
             created: now.clone(),
             updated: now,
             corroboration: evidence.to_vec(),
@@ -411,7 +463,13 @@ impl PatternStore {
             &scrubbed.fix,
             &evidence_summary(scrubbed),
         );
-        let path = self.quarantine_dir().join(format!("{}.md", scrubbed.slug));
+        // Never overwrite an earlier quarantine of the same slug: side-step to a
+        // 4-hex-char suffix so both snapshots survive for inspection.
+        let mut file_name = format!("{}.md", scrubbed.slug);
+        if self.quarantine_dir().join(&file_name).exists() {
+            file_name = format!("{}-{}.md", scrubbed.slug, hex(&rand_bytes()[..2]));
+        }
+        let path = self.quarantine_dir().join(file_name);
         self.write_atomic(&path, &content)?;
         Ok(path)
     }
@@ -421,8 +479,8 @@ impl PatternStore {
         let mut lines = vec![
             "# Wiki Pattern Catalog".to_string(),
             String::new(),
-            "| ID | Title | Scope | Status | File |".to_string(),
-            "|---|---|---|---|---|".to_string(),
+            "| ID | Title | Kind | Scope | Status | File |".to_string(),
+            "|---|---|---|---|---|---|".to_string(),
         ];
         for (_, (path, meta)) in self.catalog()? {
             let file = path
@@ -431,8 +489,8 @@ impl PatternStore {
                 .unwrap_or_default();
             let link = format!("patterns/{file}");
             lines.push(format!(
-                "| `{}` | {} | `{}` | {} | [{}]({link}) |",
-                meta.id, meta.title, meta.scope, meta.status, file
+                "| `{}` | {} | {} | `{}` | {} | [{}]({link}) |",
+                meta.id, meta.title, meta.kind, meta.scope, meta.status, file
             ));
         }
         let path = self.wiki_dir.join("index.md");
@@ -464,12 +522,15 @@ fn evidence_summary(op: &PatternOp) -> String {
     }
 }
 
-fn existing_evidence_section(content: &str) -> String {
+/// Body of a `## <name>` section from a pattern page (used to preserve section
+/// text when an op leaves the incoming field empty).
+fn existing_section(content: &str, name: &str) -> String {
+    let header = format!("## {name}");
     let mut out = String::new();
     let mut in_section = false;
     for line in content.lines() {
         if line.starts_with("## ") {
-            in_section = line.trim() == "## Evidence";
+            in_section = line.trim() == header;
             if in_section {
                 continue;
             }
@@ -480,6 +541,65 @@ fn existing_evidence_section(content: &str) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+/// Empty or whitespace-only incoming text keeps the page's current section
+/// instead of blanking it.
+fn section_text<'a>(incoming: &'a str, existing: &'a str) -> &'a str {
+    if incoming.trim().is_empty() {
+        existing
+    } else {
+        incoming
+    }
+}
+
+/// Collapse any run of CR/LF into a single space; a newline inside a frontmatter
+/// value would let free text forge additional frontmatter keys.
+fn collapse_newlines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for c in text.chars() {
+        if c == '\r' || c == '\n' {
+            pending_space = true;
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Keep only the first line of a value destined for a single frontmatter line.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Only "success" means success; every other value (including the serde-default
+/// empty string) is a failure pattern.
+fn normalize_kind(kind: &str) -> &'static str {
+    if kind.trim() == "success" {
+        "success"
+    } else {
+        "failure"
+    }
+}
+
+/// Scope must be exactly `global` or `project:<slug>`; anything else (including
+/// embedded newlines or extra frontmatter keys) is rejected.
+pub fn sanitize_scope(scope: &str) -> Result<String> {
+    let scope = scope.trim();
+    if scope == "global" {
+        return Ok(scope.to_string());
+    }
+    if let Some(project) = scope.strip_prefix("project:")
+        && is_valid_slug(project)
+    {
+        return Ok(scope.to_string());
+    }
+    bail!("invalid pattern scope `{scope}` (expected `global` or `project:<slug>`)");
 }
 
 pub fn is_valid_slug(slug: &str) -> bool {
@@ -552,6 +672,7 @@ mod tests {
     fn op(action: &str, slug: &str, sessions: &[&str]) -> PatternOp {
         PatternOp {
             action: action.into(),
+            kind: "failure".into(),
             existing_id: None,
             slug: slug.into(),
             title: "SUUMO image URLs need host-aware width".into(),
@@ -600,7 +721,7 @@ mod tests {
         assert_eq!(meta.corroboration.len(), 1);
         let created_ts = meta.created.clone();
 
-        // Second run merges new evidence with a different slug spelling (same id).
+        // Second run merges new evidence into the existing pattern (same id).
         let mut merge_op = op("merge", "suumo-image-width", &["s2"]);
         merge_op.existing_id = Some(write.pattern_id.clone());
         merge_op.fix = "Use w=1000 on SUUMO; yimg rejects width entirely".into();
@@ -630,6 +751,231 @@ mod tests {
         assert!(
             content.contains("Corroborated across sessions: s2"),
             "new evidence must be appended"
+        );
+    }
+
+    #[test]
+    fn create_for_existing_slug_promotes_to_merge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+
+        let write = store
+            .apply_op(
+                &op("create", "slug-a", &["s1"]),
+                &op("create", "slug-a", &["s1"]),
+                &corroboration(&["s1"]),
+            )
+            .expect("create");
+        assert_eq!(write.action, "created");
+
+        let (path, meta) = store
+            .catalog()
+            .expect("catalog")
+            .values()
+            .next()
+            .expect("one pattern")
+            .clone();
+        let created_ts = meta.created.clone();
+
+        // The maintainer forks: `create` for a slug that already has a page must be
+        // promoted to a merge, not replace the page under a brand-new id.
+        let write2 = store
+            .apply_op(
+                &op("create", "slug-a", &["s2"]),
+                &op("create", "slug-a", &["s2"]),
+                &corroboration(&["s2"]),
+            )
+            .expect("promoted merge");
+        assert_eq!(write2.action, "merged");
+        assert_eq!(
+            write2.pattern_id, write.pattern_id,
+            "the fork must keep the existing pattern id"
+        );
+        assert_eq!(
+            write2.file, path,
+            "the fork patches the existing file in place"
+        );
+
+        let content = std::fs::read_to_string(&path).expect("read");
+        let (merged, _) = PatternStore::parse_frontmatter(&content).expect("frontmatter");
+        assert_eq!(merged.created, created_ts, "created must survive the fork");
+        let ids: Vec<&str> = merged
+            .corroboration
+            .iter()
+            .map(|c| c.session_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s1", "s2"], "the fork must union corroboration");
+        assert_eq!(store.catalog().expect("catalog").len(), 1);
+    }
+
+    #[test]
+    fn merge_with_empty_sections_preserves_analysis() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+        let write = store
+            .apply_op(
+                &op("create", "blank-guard", &["s1"]),
+                &op("create", "blank-guard", &["s1"]),
+                &corroboration(&["s1"]),
+            )
+            .expect("create");
+
+        // An op that omits a section (serde default "") must not blank the page.
+        let mut merge_op = op("merge", "blank-guard", &["s2"]);
+        merge_op.existing_id = Some(write.pattern_id.clone());
+        merge_op.symptom = String::new();
+        merge_op.root_cause = "   ".into();
+        merge_op.fix = String::new();
+        store
+            .apply_op(&merge_op, &merge_op, &corroboration(&["s2"]))
+            .expect("merge");
+
+        let content =
+            std::fs::read_to_string(store.patterns_dir().join("blank-guard.md")).expect("read");
+        assert!(
+            content.contains("## Symptom\nImages 400"),
+            "empty symptom must preserve the existing section"
+        );
+        assert!(
+            content.contains("## Root Cause\nWidth param not accepted"),
+            "whitespace-only root_cause must preserve the existing section"
+        );
+        assert!(
+            content.contains("## Fix\nUse w=1000 only on SUUMO host"),
+            "empty fix must preserve the existing section"
+        );
+    }
+
+    #[test]
+    fn frontmatter_values_stay_single_line() {
+        let meta = PatternMeta {
+            title: "line one\nline two\r\nwith key: forged".into(),
+            superseded_by: Some("pat_1\nscrub_pass: v999".into()),
+            ..Default::default()
+        };
+        let content = PatternStore::render(&meta, "s", "rc", "f", "e");
+        assert!(
+            content.contains("title: \"line one line two with key: forged\"\n"),
+            "CR/LF in titles must collapse to single spaces"
+        );
+        assert!(
+            content.contains("superseded_by: pat_1\n"),
+            "superseded_by must keep only its first line"
+        );
+        assert!(
+            !content.contains("scrub_pass: v999"),
+            "no forged frontmatter keys may survive rendering"
+        );
+    }
+
+    #[test]
+    fn sanitize_scope_accepts_only_global_or_project_slug() {
+        assert_eq!(sanitize_scope("global").expect("global"), "global");
+        assert_eq!(
+            sanitize_scope("project:nipponhomes").expect("project"),
+            "project:nipponhomes"
+        );
+        assert!(sanitize_scope("global\nscrub_pass: v9").is_err());
+        assert!(sanitize_scope("project:Not A Slug").is_err());
+        assert!(sanitize_scope("").is_err());
+        assert!(sanitize_scope("team:memex").is_err());
+
+        // At the op level an invalid scope bails instead of writing the page.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+        let mut bad = op("create", "scope-guard", &["s1"]);
+        bad.scope = Some("global\ninjected: yes".into());
+        let err = store
+            .apply_op(&bad, &bad, &corroboration(&["s1"]))
+            .err()
+            .expect("invalid scope must bail");
+        assert!(
+            err.to_string().contains("invalid pattern scope"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!store.patterns_dir().join("scope-guard.md").exists());
+    }
+
+    #[test]
+    fn success_kind_round_trips_through_page_and_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+
+        let mut create = op("create", "parallel-cargo-jobs", &["s1"]);
+        create.kind = "success".into();
+        store
+            .apply_op(&create, &create, &corroboration(&["s1"]))
+            .expect("create");
+
+        let content = std::fs::read_to_string(store.patterns_dir().join("parallel-cargo-jobs.md"))
+            .expect("read");
+        assert!(content.contains("kind: success"));
+        let (meta, _) = PatternStore::parse_frontmatter(&content).expect("parse");
+        assert_eq!(meta.kind, "success");
+
+        // Anything that is not exactly "success" is a failure pattern.
+        let mut weird = op("create", "weird-kind", &["s1"]);
+        weird.kind = "banana".into();
+        store
+            .apply_op(&weird, &weird, &corroboration(&["s1"]))
+            .expect("create");
+        let raw =
+            std::fs::read_to_string(store.patterns_dir().join("weird-kind.md")).expect("read");
+        assert!(
+            raw.contains("kind: failure"),
+            "unknown kind must fall back to failure"
+        );
+
+        store.update_index().expect("index");
+        let index = std::fs::read_to_string(tmp.path().join("index.md")).expect("index");
+        assert!(index.contains("| Kind |"), "index gains a Kind column");
+        assert!(index.contains("| success |"));
+        assert!(index.contains("| failure |"));
+    }
+
+    #[test]
+    fn old_page_without_kind_parses_as_failure() {
+        let old_page = "---\nid: pat_old\ntitle: \"Legacy\"\nstatus: candidate\nscope: global\n\
+                        created: t1\nupdated: t1\ncorroboration:\n  []\nsuperseded_by: null\n\
+                        scrub_pass: v1\n---\n\n## Symptom\nold\n";
+        let (meta, _) = PatternStore::parse_frontmatter(old_page).expect("parse");
+        assert_eq!(
+            meta.kind, "failure",
+            "pages without kind default to failure"
+        );
+    }
+
+    #[test]
+    fn quarantine_does_not_overwrite_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+        let first = store
+            .quarantine(&op("create", "leaky", &["s1"]), &corroboration(&["s1"]))
+            .expect("first quarantine");
+        let second = store
+            .quarantine(&op("create", "leaky", &["s2"]), &corroboration(&["s2"]))
+            .expect("second quarantine");
+
+        assert_ne!(first, second, "same slug must not overwrite in quarantine");
+        assert!(first.exists() && second.exists());
+        let first_content = std::fs::read_to_string(&first).expect("read");
+        assert!(
+            first_content.contains("s1") && !first_content.contains("s2"),
+            "the first quarantine snapshot must survive"
+        );
+        let name = second
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let suffix = name
+            .strip_prefix("leaky-")
+            .and_then(|s| s.strip_suffix(".md"))
+            .expect("suffixed name");
+        assert_eq!(suffix.len(), 4, "suffix must be 4 hex chars: {name}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix must be hex: {name}"
         );
     }
 

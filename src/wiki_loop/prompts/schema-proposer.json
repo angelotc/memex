@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillProposerOutput",
+  "type": "object",
+  "required": ["skill_name", "rationale"],
+  "properties": {
+    "skill_name": { "type": ["string", "null"] },
+    "description": { "type": "string" },
+    "skill_markdown": { "type": "string" },
+    "purpose_patterns": { "type": "array", "items": { "type": "string" } },
+    "rationale": { "type": "string" }
+  }
+}

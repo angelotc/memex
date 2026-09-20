@@ -1,10 +1,14 @@
-//! Error-turn extraction and char-budgeted session digests (paper step 9: sample traces
-//! to fit the Maintainer's context).
+//! Trace sampling and char-budgeted session digests (paper step 9: sample traces to
+//! fit the Maintainer's context). Sampling is stratified per Appendix C: a maximum of
+//! 5 failing traces for root-cause analysis plus up to 3 passing traces to extract
+//! successful strategies and prevent regressions in working behaviors.
 
 use super::config::WikiLoopConfig;
 use crate::types::Record;
 
 /// Indices of records that look like tool failures, with one turn of surrounding context.
+/// Marker substrings are matched against tool output only — assistant prose that merely
+/// discusses an error must not select the turn.
 pub fn extract_error_turn_indices(records: &[Record]) -> Vec<usize> {
     let mut error_indices = Vec::new();
     for (idx, rec) in records.iter().enumerate() {
@@ -12,18 +16,19 @@ pub fn extract_error_turn_indices(records: &[Record]) -> Vec<usize> {
             error_indices.push(idx);
             continue;
         }
-        let content = rec.tool_output.as_deref().unwrap_or(&rec.text);
-        let lower = content.to_lowercase();
-        if [
-            "command failed",
-            "traceback (most recent",
-            "error: ",
-            "fatal: ",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-        {
-            error_indices.push(idx);
+        if let Some(output) = rec.tool_output.as_deref() {
+            let lower = output.to_lowercase();
+            if [
+                "command failed",
+                "traceback (most recent",
+                "error: ",
+                "fatal: ",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                error_indices.push(idx);
+            }
         }
     }
     if error_indices.is_empty() {
@@ -94,7 +99,7 @@ pub fn build_session_summary(
             .unwrap_or(&rec.text);
         if !content.is_empty() {
             let trimmed = truncate(content, 1500);
-            let suffix = if content.len() > trimmed.len() {
+            let suffix = if content.chars().count() > trimmed.chars().count() {
                 " ... [truncated]"
             } else {
                 ""
@@ -102,7 +107,73 @@ pub fn build_session_summary(
             out.push_str(&format!("  - Content: {trimmed}{suffix}\n"));
         }
     }
-    if out.len() > cfg.max_chars_per_session {
+    if out.chars().count() > cfg.max_chars_per_session {
+        out = truncate(&out, cfg.max_chars_per_session).to_string();
+        out.push_str("\n... [Session Digest Truncated]\n");
+    }
+    out
+}
+
+/// Compact digest of a session with no tool failures — the paper's passing-trace stratum:
+/// enough shape for the maintainer to extract successful strategies, without error turns.
+pub fn build_success_summary(
+    cfg: &WikiLoopConfig,
+    meta: &super::ingest::SessionMeta,
+    records: &[Record],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "### Session `{}` (Source: {}, Project: {}) — PASSING\n",
+        meta.session_id,
+        meta.source,
+        meta.repo_project
+            .clone()
+            .or_else(|| meta.project.clone())
+            .unwrap_or_else(|| "unknown".into())
+    ));
+    out.push_str(&format!(
+        "- Working Directory: `{}`\n- Message Count: {}, Resolution: {}\n",
+        meta.cwd.as_deref().unwrap_or("?"),
+        meta.message_count,
+        meta.resolution_status.as_deref().unwrap_or("?")
+    ));
+
+    // Task: the opening user request.
+    if let Some(first_user) = records
+        .iter()
+        .find(|r| r.role == "user" && !r.text.is_empty())
+    {
+        out.push_str(&format!(
+            "- Task: {}\n",
+            truncate(first_user.text.trim(), 500)
+        ));
+    }
+    // Outcome: the final substantive assistant turn.
+    if let Some(last) = records
+        .iter()
+        .rev()
+        .find(|r| r.role == "assistant" && !r.text.trim().is_empty())
+    {
+        out.push_str(&format!(
+            "- Outcome: {}\n",
+            truncate(last.text.trim(), 1200)
+        ));
+    }
+    // Shape of the workflow: tool usage histogram (what the agent actually did).
+    let mut tools: std::collections::BTreeMap<&str, usize> = Default::default();
+    for rec in records.iter().filter_map(|r| r.tool_name.as_deref()) {
+        *tools.entry(rec).or_default() += 1;
+    }
+    if !tools.is_empty() {
+        let usage = tools
+            .iter()
+            .map(|(t, n)| format!("{t}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("- Tools used: {usage}\n"));
+    }
+
+    if out.chars().count() > cfg.max_chars_per_session {
         out = truncate(&out, cfg.max_chars_per_session).to_string();
         out.push_str("\n... [Session Digest Truncated]\n");
     }
@@ -114,7 +185,7 @@ pub fn build_session_summary(
 pub fn build_batch_digest(cfg: &WikiLoopConfig, summaries: &[String]) -> String {
     let mut out = String::new();
     for (i, summary) in summaries.iter().enumerate() {
-        if out.len() + summary.len() > cfg.max_chars_per_batch {
+        if out.chars().count() + summary.chars().count() > cfg.max_chars_per_batch {
             out.push_str("\n\n... [Batch Digest Truncated at Char Limit]");
             break;
         }
@@ -122,6 +193,30 @@ pub fn build_batch_digest(cfg: &WikiLoopConfig, summaries: &[String]) -> String 
             out.push_str("\n\n---\n\n");
         }
         out.push_str(summary);
+    }
+    out
+}
+
+/// Stratified batch digest (paper Appendix C): failing summaries first for root-cause
+/// analysis, then passing summaries for strategy extraction, under one shared budget.
+pub fn build_stratified_digest(
+    cfg: &WikiLoopConfig,
+    failing: &[String],
+    passing: &[String],
+) -> String {
+    let mut out = String::new();
+    if !failing.is_empty() {
+        out.push_str("## Failing Sessions (root-cause analysis)\n\n");
+        out.push_str(&build_batch_digest(cfg, failing));
+    }
+    if !passing.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n---\n\n");
+        }
+        out.push_str(
+            "## Passing Sessions (extract successful strategies; prevent regressions)\n\n",
+        );
+        out.push_str(&build_batch_digest(cfg, passing));
     }
     out
 }
@@ -164,6 +259,22 @@ mod tests {
         }
     }
 
+    fn meta() -> super::super::ingest::SessionMeta {
+        super::super::ingest::SessionMeta {
+            source: "claude".into(),
+            session_id: "s1".into(),
+            source_path: None,
+            project: Some("p".into()),
+            cwd: Some("/app".into()),
+            git_root: None,
+            repo_project: Some("p".into()),
+            started_at: 0,
+            last_at: 0,
+            message_count: 4,
+            resolution_status: Some("done".into()),
+        }
+    }
+
     #[test]
     fn extracts_error_turn_with_context() {
         let records = vec![
@@ -183,28 +294,66 @@ mod tests {
     }
 
     #[test]
-    fn budgets_are_respected() {
+    fn assistant_prose_discussing_errors_does_not_select() {
+        // "error: " in assistant prose (no tool output) must not flag the turn.
+        let records = vec![
+            record(1, "user", "hello", None),
+            record(
+                2,
+                "assistant",
+                "we saw error: foo last week, this time it's fine",
+                None,
+            ),
+        ];
+        assert!(extract_error_turn_indices(&records).is_empty());
+    }
+
+    #[test]
+    fn marker_in_tool_output_selects() {
+        let mut rec = record(2, "tool", "", None);
+        rec.tool_output = Some("npm error: code ELIFECYCLE\ncommand failed".into());
+        let idx = extract_error_turn_indices(&[rec]);
+        assert_eq!(idx, vec![0]);
+    }
+
+    #[test]
+    fn success_summary_covers_task_outcome_and_tools() {
         let cfg = WikiLoopConfig::default();
-        let mut cfg = cfg.clone();
+        let mut tool_rec = record(2, "assistant", "", None);
+        tool_rec.tool_name = Some("bash".into());
+        tool_rec.tool_input = Some("cargo test".into());
+        let records = vec![
+            record(1, "user", "please fix the flaky test", None),
+            tool_rec,
+            record(3, "assistant", "Fixed by retrying the assertion.", None),
+        ];
+        let s = build_success_summary(&cfg, &meta(), &records);
+        assert!(s.contains("PASSING"));
+        assert!(s.contains("Task: please fix the flaky test"));
+        assert!(s.contains("Outcome: Fixed by retrying the assertion."));
+        assert!(s.contains("Tools used: bash×1"));
+    }
+
+    #[test]
+    fn budgets_are_respected() {
+        let mut cfg = WikiLoopConfig::default();
         cfg.max_chars_per_session = 5000;
         cfg.max_chars_per_batch = 100;
-        let meta = super::super::ingest::SessionMeta {
-            source: "claude".into(),
-            session_id: "s1".into(),
-            source_path: None,
-            project: Some("p".into()),
-            cwd: Some("/app".into()),
-            git_root: None,
-            repo_project: Some("p".into()),
-            started_at: 0,
-            last_at: 0,
-            message_count: 4,
-            resolution_status: Some("done".into()),
-        };
         let records = vec![record(1, "user", "hello", None)];
-        let s = build_session_summary(&cfg, &meta, &records, &[0]);
+        let s = build_session_summary(&cfg, &meta(), &records, &[0]);
         assert!(s.contains("Session `s1`"));
         let batch = build_batch_digest(&cfg, &[s.clone(), "y".repeat(500)]);
-        assert!(batch.len() < 250, "batch budget must truncate");
+        assert!(batch.chars().count() < 250, "batch budget must truncate");
+    }
+
+    #[test]
+    fn stratified_digest_orders_failing_then_passing() {
+        let cfg = WikiLoopConfig::default();
+        let d = build_stratified_digest(&cfg, &["F1".into(), "F2".into()], &["P1".into()]);
+        let f = d.find("## Failing Sessions").expect("failing header");
+        let p = d.find("## Passing Sessions").expect("passing header");
+        assert!(f < p, "failing stratum comes first");
+        assert!(d.contains("F1") && d.contains("P1"));
+        assert!(build_stratified_digest(&cfg, &[], &[]).is_empty());
     }
 }

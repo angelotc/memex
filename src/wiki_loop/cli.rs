@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use std::path::Path;
+use std::path::PathBuf;
 
 use super::config::WikiLoopConfig;
 use super::digest;
@@ -13,7 +13,8 @@ use super::ledger::StateLedger;
 use super::lock::RoleLock;
 use super::patterns::{PatternStore, scrub_op};
 use super::proposer;
-use super::queue::{QueueManager, now_ms};
+use super::queue::{QueueEntry, QueueManager, now_ms};
+use crate::types::Record;
 
 #[derive(Debug, Subcommand)]
 pub enum WikiLoopCommand {
@@ -34,11 +35,8 @@ pub enum WikiLoopCommand {
         /// Build the prompt and digest but do not invoke the maintainer model or write
         #[arg(long)]
         dry_run: bool,
-        /// Write to the live wiki (~/.memex/wiki) instead of the staging wiki
-        #[arg(long, conflicts_with = "dry_run")]
-        live: bool,
     },
-    /// Run the Skill Proposer: stage at most one atomic skill proposal
+    /// Run the Skill Proposer: stage at most one atomic skill proposal per store
     RunProposer {
         #[arg(long)]
         dry_run: bool,
@@ -74,9 +72,28 @@ pub fn run(command: WikiLoopCommand) -> Result<()> {
             println!("enqueued {}:{} -> {}", source, session_id, path.display());
             Ok(())
         }
-        WikiLoopCommand::RunMaintainer { dry_run, live } => run_maintainer(dry_run, live),
+        WikiLoopCommand::RunMaintainer { dry_run } => {
+            let cfg = WikiLoopConfig::load(None)?;
+            // The wiki lock serializes against the proposer so it never reads a wiki
+            // mid-write; the role lock prevents overlapping maintainer crons.
+            let _locks = match acquire_locks(&cfg, &["wiki", "maintainer"]) {
+                Ok(locks) => locks,
+                Err(e) => {
+                    eprintln!("note: {e}; exiting");
+                    return Ok(());
+                }
+            };
+            run_maintainer(&cfg, dry_run)
+        }
         WikiLoopCommand::RunProposer { dry_run } => {
             let cfg = WikiLoopConfig::load(None)?;
+            let _locks = match acquire_locks(&cfg, &["wiki", "proposer"]) {
+                Ok(locks) => locks,
+                Err(e) => {
+                    eprintln!("note: {e}; exiting");
+                    return Ok(());
+                }
+            };
             let ledger = StateLedger::open(&cfg.state_db)?;
             println!("{}", proposer::run_proposer(&cfg, &ledger, dry_run)?);
             Ok(())
@@ -87,17 +104,20 @@ pub fn run(command: WikiLoopCommand) -> Result<()> {
         } => {
             let cfg = WikiLoopConfig::load(None)?;
             let ledger = StateLedger::open(&cfg.state_db)?;
+            let _locks = acquire_locks(&cfg, &["delivery"])?;
             run_validate(&cfg, &ledger, &proposal_id, skip_tier1)
         }
         WikiLoopCommand::Apply { proposal_id } => {
             let cfg = WikiLoopConfig::load(None)?;
             let ledger = StateLedger::open(&cfg.state_db)?;
+            let _locks = acquire_locks(&cfg, &["delivery"])?;
             println!("{}", apply_proposal(&cfg, &ledger, &proposal_id)?);
             Ok(())
         }
         WikiLoopCommand::Rollback { skill_name } => {
             let cfg = WikiLoopConfig::load(None)?;
             let ledger = StateLedger::open(&cfg.state_db)?;
+            let _locks = acquire_locks(&cfg, &["delivery"])?;
             println!("{}", rollback_skill(&cfg, &ledger, &skill_name)?);
             Ok(())
         }
@@ -112,23 +132,24 @@ pub fn run(command: WikiLoopCommand) -> Result<()> {
     }
 }
 
-fn run_maintainer(dry_run: bool, live: bool) -> Result<()> {
-    let cfg = WikiLoopConfig::load(None)?;
-    let lock_dir = cfg
-        .state_db
+fn lock_dir(cfg: &WikiLoopConfig) -> Result<PathBuf> {
+    cfg.state_db
         .parent()
         .map(|p| p.join("locks"))
-        .context("state db has no parent directory")?;
+        .context("state db has no parent directory")
+}
 
-    // Single-instance per role; cron overlap exits cleanly.
-    let _lock = match RoleLock::try_acquire(&lock_dir, "maintainer") {
-        Ok(lock) => lock,
-        Err(e) => {
-            eprintln!("note: {e}; exiting");
-            return Ok(());
-        }
-    };
+/// Acquire role locks in the given (fixed) order; the caller keeps the returned guards
+/// alive for the duration of its mutation.
+fn acquire_locks(cfg: &WikiLoopConfig, roles: &[&str]) -> Result<Vec<RoleLock>> {
+    let dir = lock_dir(cfg)?;
+    roles
+        .iter()
+        .map(|role| RoleLock::try_acquire(&dir, role))
+        .collect()
+}
 
+fn run_maintainer(cfg: &WikiLoopConfig, dry_run: bool) -> Result<()> {
     let ledger = StateLedger::open(&cfg.state_db)?;
 
     // Circuit breaker: after 3 consecutive maintainer failures, stay quiet and notify
@@ -145,7 +166,7 @@ fn run_maintainer(dry_run: bool, live: bool) -> Result<()> {
     }
 
     let run_id = ledger.start_run("maintainer")?;
-    let result = execute_maintainer(&cfg, &ledger, run_id, dry_run, live);
+    let result = execute_maintainer(cfg, &ledger, run_id, dry_run);
     if let Err(e) = &result {
         let _ = ledger.finish_run(run_id, "error", 0, 0, Some(&format!("{e:#}")));
         if cfg.notify_on_failure {
@@ -159,12 +180,20 @@ fn run_maintainer(dry_run: bool, live: bool) -> Result<()> {
     result
 }
 
+/// One claimed session, classified by outcome.
+struct Candidate {
+    entry: QueueEntry,
+    fingerprint: u64,
+    meta: ingest::SessionMeta,
+    records: Vec<Record>,
+    failing: bool,
+}
+
 fn execute_maintainer(
     cfg: &WikiLoopConfig,
     ledger: &StateLedger,
     run_id: i64,
     dry_run: bool,
-    live: bool,
 ) -> Result<()> {
     let queue = QueueManager::new(&cfg.queue_dir)?;
     let claimed = queue.claim(cfg.max_batch_size, cfg.quiet_minutes)?;
@@ -177,10 +206,12 @@ fn execute_maintainer(
 
     let analytics_db = cfg.analytics_db();
     let index_dir = cfg.index_dir()?;
-    let mut batch: Vec<(super::queue::QueueEntry, u64, ingest::SessionMeta, String)> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     for (entry, fingerprint) in &claimed {
-        if ledger.is_processed(&entry.source, &entry.session_id) {
+        // Processed only through the last_event_at this entry now carries: a session
+        // resumed since its last compile owes a re-compile of the new turns.
+        if ledger.is_processed(&entry.source, &entry.session_id, entry.last_event_at) {
             let _ = queue.ack_if_unchanged(entry, *fingerprint);
             continue;
         }
@@ -198,8 +229,16 @@ fn execute_maintainer(
                 "session {}:{} has {} turns (< {}); skipping as trivial",
                 meta.source, meta.session_id, meta.message_count, cfg.min_turns
             );
-            ledger.mark_processed(&entry.source, &entry.session_id, "skipped_trivial", &[])?;
-            let _ = queue.ack_if_unchanged(entry, *fingerprint);
+            let acked = queue.ack_if_unchanged(entry, *fingerprint)?;
+            if acked {
+                ledger.mark_processed(
+                    &entry.source,
+                    &entry.session_id,
+                    "skipped_trivial",
+                    &[],
+                    entry.last_event_at,
+                )?;
+            }
             continue;
         }
         let records = match ingest::load_records(&index_dir, &meta) {
@@ -209,126 +248,165 @@ fn execute_maintainer(
                 continue;
             }
         };
-        let indices = digest::extract_error_turn_indices(&records);
-        if indices.is_empty() {
-            ledger.mark_processed(&entry.source, &entry.session_id, "ok", &[])?;
-            let _ = queue.ack_if_unchanged(entry, *fingerprint);
+        // An empty or short read is an index that has not caught up, not a session
+        // without errors — compiling it would permanently drop real traces.
+        if !ingest::records_complete(&records, &meta) {
+            queue.nack(
+                entry,
+                &format!(
+                    "partial trace: {} of {} message(s) indexed; retrying for the full session",
+                    records.len(),
+                    meta.message_count
+                ),
+                5,
+            )?;
             continue;
         }
-        let summary = digest::build_session_summary(cfg, &meta, &records, &indices);
-        batch.push((entry.clone(), *fingerprint, meta, summary));
+        let failing = !digest::extract_error_turn_indices(&records).is_empty();
+        candidates.push(Candidate {
+            entry: entry.clone(),
+            fingerprint: *fingerprint,
+            meta,
+            records,
+            failing,
+        });
     }
 
-    if batch.is_empty() {
-        ledger.finish_run(run_id, "ok", 0, 0, None)?;
-        println!("no sessions required pattern analysis");
-        return Ok(());
-    }
-
-    let wiki_dir = cfg.wiki_dir(live);
-    let store = PatternStore::new(&wiki_dir)?;
-
-    let summaries: Vec<String> = batch.iter().map(|(_, _, _, s)| s.clone()).collect();
-    let batch_digest = digest::build_batch_digest(cfg, &summaries);
-
-    let catalog: Vec<super::patterns::PatternMeta> = store
-        .catalog()?
-        .into_values()
-        .map(|(_, meta)| meta)
-        .collect();
-    let catalog_summary = if catalog.is_empty() {
-        "None yet.".to_string()
-    } else {
-        let mut lines = vec!["id | slug | title | scope | status".to_string()];
-        for meta in &catalog {
-            lines.push(format!(
-                "{} | {} | {} | {} | {}",
-                meta.id,
-                meta.file.trim_end_matches(".md"),
-                meta.title,
-                meta.scope,
-                meta.status
-            ));
+    // Stratified sampling (paper Appendix C): up to N failing + M passing sessions,
+    // oldest first; overflow stays queued and is the next run's head of the line.
+    let mut ordered = candidates;
+    ordered.sort_by_key(|c| c.entry.enqueued_at);
+    let mut failing: Vec<&Candidate> = Vec::new();
+    let mut passing: Vec<&Candidate> = Vec::new();
+    for candidate in &ordered {
+        if candidate.failing {
+            if failing.len() < cfg.max_failing_sessions {
+                failing.push(candidate);
+            }
+        } else if passing.len() < cfg.max_passing_sessions {
+            passing.push(candidate);
         }
-        lines.join("\n")
-    };
-
-    let prompt = super::prompts::MAINTAINER
-        .replace("{digest}", &format!(
-            "### Existing Pattern Catalog\n\n{catalog_summary}\n\n### Error Trace Digest\n\n{batch_digest}"
-        ));
-
-    if dry_run {
-        ledger.finish_run(run_id, "ok", batch.len() as i64, 0, None)?;
-        println!(
-            "dry run: maintainer prompt built ({} chars) from {} session(s); queue left untouched",
-            prompt.len(),
-            batch.len()
-        );
-        println!("--- prompt preview ---");
-        println!("{}", prompt.chars().take(1200).collect::<String>());
+    }
+    let selected: Vec<&Candidate> = failing.iter().chain(passing.iter()).copied().collect();
+    if selected.is_empty() {
+        ledger.finish_run(run_id, "ok", 0, 0, None)?;
+        println!("no new sessions to compile");
         return Ok(());
     }
+    let selected_total = selected.len();
 
-    // ---- Maintain (paper step 10). The model only emits JSON; the orchestrator owns
-    // every write to the wiki.
-    let raw = harness::run_role(
-        &cfg.maintainer,
-        &prompt,
-        None,
-        std::time::Duration::from_secs(cfg.subprocess_timeout_secs),
-    )?;
-    let value = harness::extract_json_object(&raw)?;
-    #[derive(serde::Deserialize)]
-    struct MaintainerOutput {
-        #[serde(default)]
-        patterns: Vec<super::patterns::PatternOp>,
-        #[serde(default)]
-        summary: String,
-    }
-    let output: MaintainerOutput =
-        serde_json::from_value(value).context("parsing maintainer JSON output")?;
+    let mut ok_ops = 0usize;
+    let mut quarantined_ops = 0usize;
+    let mut failed_ops = 0usize;
 
-    let mut written = 0i64;
-    let mut pattern_ids: Vec<String> = Vec::new();
-    let mut log_lines = vec![format!(
-        "## {} — maintainer run {} over {} session(s)",
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        run_id,
-        batch.len()
-    )];
-
-    for op in &output.patterns {
-        let (scrubbed, quarantined) = scrub_op(op);
-        // Evidence correlation: only cite sessions that were actually in this digest.
-        let known: std::collections::HashSet<&str> = batch
+    {
+        let failing_summaries: Vec<String> = failing
             .iter()
-            .map(|(_, _, m, _)| m.session_id.as_str())
-            .collect();
-        let evidence: Vec<super::patterns::Corroboration> = scrubbed
-            .evidence_session_ids
-            .iter()
-            .filter(|sid| known.contains(sid.as_str()))
-            .filter_map(|sid| {
-                batch
-                    .iter()
-                    .find(|(_, _, m, _)| m.session_id == *sid)
-                    .map(|(_, _, m, _)| super::patterns::Corroboration {
-                        source: m.source.clone(),
-                        session_id: sid.clone(),
-                        ts: m.last_at,
-                    })
+            .map(|c| {
+                let indices = digest::extract_error_turn_indices(&c.records);
+                digest::build_session_summary(cfg, &c.meta, &c.records, &indices)
             })
             .collect();
+        let passing_summaries: Vec<String> = passing
+            .iter()
+            .map(|c| digest::build_success_summary(cfg, &c.meta, &c.records))
+            .collect();
 
-        let outcome = if quarantined {
-            let path = store.quarantine(&scrubbed, &evidence)?;
-            println!("quarantined suspect pattern -> {}", path.display());
-            format!("quarantined {}", scrubbed.slug)
+        let store = PatternStore::new(&cfg.wiki_root)?;
+
+        let prompt = super::prompts::MAINTAINER.replace(
+            "{digest}",
+            &format!(
+                "### Existing Pattern Pages\n\n{}\n\n### Trace Digest\n\n{}",
+                pattern_page_bodies(&store)?,
+                digest::build_stratified_digest(cfg, &failing_summaries, &passing_summaries)
+            ),
+        );
+
+        if dry_run {
+            let preview = prompt.chars().take(1200).collect::<String>();
+            ledger.finish_run(run_id, "ok", selected_total as i64, 0, None)?;
+            println!("dry run: {selected_total} session(s) selected; queue left untouched");
+            println!("--- prompt preview ---");
+            println!("{preview}");
+            return Ok(());
+        }
+
+        // ---- Maintain (paper step 10). The model only emits JSON; the orchestrator
+        // owns every write to the wiki.
+        let schema = if cfg.maintainer.json_schema {
+            Some(cfg.schema_path("maintainer", super::prompts::MAINTAINER_SCHEMA)?)
         } else {
+            None
+        };
+        let raw = harness::run_role(
+            &cfg.maintainer,
+            &prompt,
+            schema.as_deref(),
+            std::time::Duration::from_secs(cfg.subprocess_timeout_secs),
+        )?;
+        let value = harness::extract_json_object(&raw)?;
+        #[derive(serde::Deserialize)]
+        struct MaintainerOutput {
+            // No serde default: output without a `patterns` key is a malformed response,
+            // not "nothing to record" — the batch must stay queued.
+            patterns: Vec<super::patterns::PatternOp>,
+            #[serde(default)]
+            summary: String,
+        }
+        let output: MaintainerOutput =
+            serde_json::from_value(value).context("parsing maintainer JSON output")?;
+        if output.patterns.is_empty() && output.summary.trim().is_empty() {
+            bail!(
+                "maintainer produced no structured output (0 patterns, empty summary); \
+                 leaving {} session(s) queued",
+                selected.len()
+            );
+        }
+
+        let mut log_lines = vec![format!(
+            "## {} — maintainer run {} over {} session(s)",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            run_id,
+            selected.len()
+        )];
+        // Successful writes with the sessions that evidence them (provenance join).
+        let mut written_patterns: Vec<(String, Vec<String>)> = Vec::new();
+
+        for op in &output.patterns {
+            let (scrubbed, quarantined) = scrub_op(op);
+            // Evidence correlation: only cite sessions that were actually in this digest.
+            let known: std::collections::HashSet<&str> = selected
+                .iter()
+                .map(|c| c.meta.session_id.as_str())
+                .collect();
+            let evidence: Vec<super::patterns::Corroboration> = scrubbed
+                .evidence_session_ids
+                .iter()
+                .filter(|sid| known.contains(sid.as_str()))
+                .filter_map(|sid| {
+                    selected
+                        .iter()
+                        .find(|c| c.meta.session_id == *sid)
+                        .map(|c| super::patterns::Corroboration {
+                            source: c.meta.source.clone(),
+                            session_id: sid.clone(),
+                            ts: c.meta.last_at,
+                        })
+                })
+                .collect();
+
+            if quarantined {
+                let path = store.quarantine(&scrubbed, &evidence)?;
+                println!("quarantined suspect pattern -> {}", path.display());
+                log_lines.push(format!("- quarantined {}", scrubbed.slug));
+                quarantined_ops += 1;
+                written_patterns
+                    .push((scrubbed.slug.clone(), scrubbed.evidence_session_ids.clone()));
+                continue;
+            }
             match store.apply_op(op, &scrubbed, &evidence) {
                 Ok(write) => {
-                    pattern_ids.push(write.pattern_id.clone());
                     println!(
                         "{} pattern {} ({}) -> {}",
                         write.action,
@@ -336,60 +414,128 @@ fn execute_maintainer(
                         write.pattern_id,
                         write.file.display()
                     );
-                    format!("{} {} ({})", write.action, scrubbed.slug, write.pattern_id)
+                    log_lines.push(format!(
+                        "{} {} ({})",
+                        write.action, scrubbed.slug, write.pattern_id
+                    ));
+                    ok_ops += 1;
+                    written_patterns.push((
+                        write.pattern_id.clone(),
+                        scrubbed.evidence_session_ids.clone(),
+                    ));
                 }
                 Err(e) => {
                     eprintln!("warning: pattern op `{}` failed: {e:#}", op.action);
-                    format!("failed {} {}: {e}", op.action, scrubbed.slug)
+                    log_lines.push(format!("failed {} {}: {e}", op.action, scrubbed.slug));
+                    failed_ops += 1;
                 }
             }
-        };
-        log_lines.push(format!("- {outcome}"));
-        written += 1;
-    }
-    log_lines.push(format!(
-        "- summary: {}",
-        if output.summary.is_empty() {
-            "(none)"
-        } else {
-            &output.summary
         }
-    ));
-    store.append_log(&log_lines.join("\n"))?;
-    store.append_log("")?;
-    store.update_index()?;
+        log_lines.push(format!(
+            "- summary: {}",
+            if output.summary.is_empty() {
+                "(none)"
+            } else {
+                &output.summary
+            }
+        ));
+        store.append_log(&log_lines.join("\n"))?;
+        store.append_log("")?;
+        store.update_index()?;
 
-    // ---- Ack only entries that did not change mid-run; mark processed with the
-    // patterns each session contributed (provenance join).
-    for (entry, fingerprint, _, _) in &batch {
-        let contributed: Vec<String> = pattern_ids
-            .iter()
-            .filter(|_| {
-                output
-                    .patterns
-                    .iter()
-                    .any(|op| op.evidence_session_ids.contains(&entry.session_id))
-            })
-            .cloned()
-            .collect();
-        ledger.mark_processed(&entry.source, &entry.session_id, "ok", &contributed)?;
-        let acked = queue.ack_if_unchanged(entry, *fingerprint)?;
-        if !acked {
-            eprintln!(
-                "note: {}:{} was updated mid-run; left queued for the next pass",
-                entry.source, entry.session_id
-            );
+        // ---- Ack only entries that did not change mid-run, and mark processed only
+        // after the ack (paper: at-least-once; a changed entry re-compiles next run).
+        for candidate in &selected {
+            let entry = &candidate.entry;
+            let acked = queue.ack_if_unchanged(entry, candidate.fingerprint)?;
+            if !acked {
+                eprintln!(
+                    "note: {}:{} was updated mid-run; left queued to recompile the new turns",
+                    entry.source, entry.session_id
+                );
+                continue;
+            }
+            let contributed: Vec<String> = written_patterns
+                .iter()
+                .filter(|(_, sessions)| sessions.contains(&entry.session_id))
+                .map(|(pattern_id, _)| pattern_id.clone())
+                .collect();
+            ledger.mark_processed(
+                &entry.source,
+                &entry.session_id,
+                "ok",
+                &contributed,
+                entry.last_event_at,
+            )?;
         }
+
+        println!(
+            "wiki: {} session(s) ({} failing / {} passing) -> {}",
+            selected.len(),
+            failing.len(),
+            passing.len(),
+            cfg.wiki_root.display()
+        );
     }
 
-    ledger.finish_run(run_id, "ok", batch.len() as i64, written, None)?;
+    // A run whose every op failed is a systematic write failure — the circuit breaker
+    // must see it, not a green "ok" row.
+    let total_ops = ok_ops + quarantined_ops + failed_ops;
+    if total_ops > 0 && ok_ops + quarantined_ops == 0 {
+        bail!("all {total_ops} pattern op(s) failed this run; inspect the wiki store for cause");
+    }
+
+    ledger.finish_run(
+        run_id,
+        "ok",
+        selected_total as i64,
+        (ok_ops + quarantined_ops) as i64,
+        None,
+    )?;
     println!(
-        "maintainer finished: {} session(s), {} pattern op(s) -> {}",
-        batch.len(),
-        written,
-        wiki_dir.display()
+        "maintainer finished: {} session(s), {} pattern op(s) ok, {} quarantined, {} failed",
+        selected_total, ok_ops, quarantined_ops, failed_ops
     );
     Ok(())
+}
+
+/// Full text of the existing pattern pages for the maintainer prompt (paper §3.2.2: the
+/// maintainer receives the wiki, not a one-line catalog). Most recently updated pages
+/// first, page- and total-bounded so a large wiki cannot blow the context.
+fn pattern_page_bodies(store: &PatternStore) -> Result<String> {
+    let mut pages: Vec<(String, String)> = Vec::new();
+    for (_, (path, meta)) in store.catalog()? {
+        if meta.status == "quarantined" {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            pages.push((meta.updated.clone(), content));
+        }
+    }
+    // RFC 3339 timestamps at fixed precision sort lexicographically.
+    pages.sort_by(|a, b| b.0.cmp(&a.0));
+    pages.truncate(30);
+
+    let mut out = String::new();
+    let mut total = 0usize;
+    for (_, content) in pages {
+        let mut body: String = content.chars().take(2000).collect();
+        if body.chars().count() == 2000 {
+            body.push_str("\n... [page truncated]");
+        }
+        if total + body.len() > 40 * 1024 {
+            out.push_str("... [more pattern pages truncated]\n");
+            break;
+        }
+        total += body.len();
+        out.push_str(&body);
+        out.push_str("\n\n---\n\n");
+    }
+    Ok(if out.is_empty() {
+        "None yet.".to_string()
+    } else {
+        out
+    })
 }
 
 fn run_validate(
@@ -402,9 +548,17 @@ fn run_validate(
     let skill_md = proposal.skill_markdown(&cfg.proposals_dir)?;
     let existing =
         std::fs::read_to_string(cfg.skills_root.join(&proposal.skill_name).join("SKILL.md")).ok();
+    let scopes = contributing_scopes(cfg, &proposal);
 
     let mut all_passed = true;
-    let mut results = super::gates::tier0(cfg, ledger, &proposal, &skill_md, existing.as_deref())?;
+    let mut results = super::gates::tier0(
+        cfg,
+        ledger,
+        &proposal,
+        &skill_md,
+        existing.as_deref(),
+        &scopes,
+    )?;
     for (name, result) in results.drain(..) {
         all_passed &= result.passed;
         println!(
@@ -416,7 +570,7 @@ fn run_validate(
     }
 
     if all_passed && !skip_tier1 {
-        match super::gates::tier1(cfg, &proposal, &skill_md) {
+        match super::gates::tier1(cfg, &proposal, &skill_md, &scopes) {
             Ok(Some(result)) => {
                 all_passed &= result.passed;
                 println!(
@@ -441,6 +595,7 @@ fn run_validate(
         }
     }
 
+    let previous_status = proposal.status.clone();
     proposal.status = if all_passed { "validated" } else { "rejected" }.into();
     proposal.save(&cfg.proposals_dir)?;
     ledger.set_proposal_status(
@@ -448,16 +603,61 @@ fn run_validate(
         &proposal.status,
         &serde_json::to_string(&proposal.gates)?,
     )?;
+
+    // Paper §3.2.4: after each validation evaluation the harness appends to
+    // `skill-impact.md` — the audit trail the proposer reads to avoid repeating rejected
+    // interventions. A re-validation that flips the status is exactly such a decision.
+    if proposal.status != previous_status {
+        let diff = proposal.diff(&cfg.proposals_dir).unwrap_or_default();
+        super::gates::append_skill_impact(
+            &cfg.wiki_root,
+            &format!(
+                "## {} — validation — {} — {}\n- decision: {}\n- gates: {}\n- patterns: {}\n\n```diff\n{}\n```\n",
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                proposal.id,
+                proposal.skill_name,
+                proposal.status,
+                proposal
+                    .gates
+                    .iter()
+                    .map(|(k, g)| format!("{k}={}", if g.passed { "pass" } else { "FAIL" }))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                proposal.purpose_patterns.join(", "),
+                diff
+            ),
+        )?;
+    }
     println!("proposal {proposal_id}: {}", proposal.status);
     Ok(())
+}
+
+/// Scopes of the wiki patterns that motivated a proposal — what the fail-closed
+/// Tier-0/Tier-1 gates check global proposals against.
+fn contributing_scopes(cfg: &WikiLoopConfig, proposal: &Proposal) -> Vec<String> {
+    let mut scopes = Vec::new();
+    if cfg.wiki_root.exists()
+        && let Ok(store) = PatternStore::new(&cfg.wiki_root)
+        && let Ok(catalog) = store.catalog()
+    {
+        for id in &proposal.purpose_patterns {
+            if let Some((_, meta)) = catalog.get(id) {
+                scopes.push(meta.scope.clone());
+            }
+        }
+    }
+    if let Some(project) = proposal.scope.strip_prefix("project:") {
+        scopes.push(format!("project:{project}"));
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn run_status(cfg: &WikiLoopConfig) -> Result<()> {
     let queue = QueueManager::new(&cfg.queue_dir)?;
     let (pending, dlq) = queue.counts()?;
     let ledger = StateLedger::open(&cfg.state_db)?;
-    let staging_patterns = count_patterns(&cfg.wiki_dir(false));
-    let live_patterns = count_patterns(&cfg.wiki_dir(true));
 
     println!("=== wiki-loop status ===");
     println!(
@@ -465,10 +665,13 @@ fn run_status(cfg: &WikiLoopConfig) -> Result<()> {
         cfg.queue_dir.display()
     );
     println!(
-        "wiki:       {live_patterns} live pattern(s) in {}, {staging_patterns} staged in {}",
-        cfg.wiki_root.display(),
-        cfg.wiki_staging.display()
+        "wiki:       {} pattern(s) in {}",
+        count_patterns(&cfg.wiki_root),
+        cfg.wiki_root.display()
     );
+    if let Some(root) = &cfg.workspace_root {
+        println!("workspace:  {} (wiki + skills base)", root.display());
+    }
     println!("skills:     {}", cfg.skills_root.display());
     println!("proposals:  {}", cfg.proposals_dir.display());
     let week_ago = now_ms() - 7 * 24 * 3_600_000;
@@ -505,7 +708,7 @@ fn run_status(cfg: &WikiLoopConfig) -> Result<()> {
     Ok(())
 }
 
-fn count_patterns(wiki_dir: &Path) -> usize {
+fn count_patterns(wiki_dir: &std::path::Path) -> usize {
     std::fs::read_dir(wiki_dir.join("patterns"))
         .map(|entries| {
             entries
@@ -539,14 +742,25 @@ fn run_doctor(cfg: &WikiLoopConfig) -> Result<()> {
         }
     }
 
+    match &cfg.workspace_root {
+        Some(root) if root.exists() => {
+            println!("[ok] workspace root: {}", root.display());
+        }
+        Some(root) => {
+            ok = false;
+            println!("[fail] workspace root missing: {}", root.display());
+        }
+        None => {}
+    }
+
     for dir in [
         &cfg.queue_dir,
         &cfg.state_db
             .parent()
-            .unwrap_or(Path::new("/tmp"))
+            .unwrap_or(std::path::Path::new("/tmp"))
             .to_path_buf(),
         &cfg.proposals_dir,
-        &cfg.wiki_staging,
+        &cfg.wiki_root,
     ] {
         match std::fs::create_dir_all(dir) {
             Ok(()) => println!("[ok] writable: {}", dir.display()),

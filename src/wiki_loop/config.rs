@@ -25,10 +25,11 @@ pub struct RoleConfig {
 
 impl RoleConfig {
     fn agy(model: &str, effort: &str) -> Self {
+        // No `-p`: this agy build made it consume the next flag as its prompt argument.
+        // Piped stdin (how the harness always sends the prompt) engages print mode anyway.
         Self {
             command: vec![
                 "agy".into(),
-                "-p".into(),
                 "--output-format".into(),
                 "json".into(),
                 "--model".into(),
@@ -65,14 +66,25 @@ pub struct WikiLoopConfig {
     pub queue_dir: PathBuf,
     pub state_db: PathBuf,
     pub wiki_root: PathBuf,
-    pub wiki_staging: PathBuf,
     pub skills_root: PathBuf,
     pub proposals_dir: PathBuf,
+    /// Optional workspace root (e.g. `/apps`) holding the projects this loop compiles
+    /// experience from. When set, the wiki and skills base defaults to `<root>/wiki`
+    /// and `<root>/skills` — one shared knowledge base for every project under the
+    /// root, with per-project attribution carried by pattern/proposal scope stamps
+    /// (`project:<name>`), not by partitioned stores. Explicit `wiki_root` /
+    /// `skills_root` keys still override.
+    pub workspace_root: Option<PathBuf>,
     /// Quiet window a session must sit through (after ending) before the maintainer claims it.
     pub quiet_minutes: i64,
     /// Sessions with fewer analytics turns than this are skipped as trivial.
     pub min_turns: i64,
+    /// Sessions claimed per maintainer run, before stratification.
     pub max_batch_size: usize,
+    /// Failing sessions fed to the maintainer per run (paper Appendix C: ≤5).
+    pub max_failing_sessions: usize,
+    /// Passing sessions fed to the maintainer per run (paper Appendix C: ≤3).
+    pub max_passing_sessions: usize,
     pub max_chars_per_session: usize,
     pub max_chars_per_batch: usize,
     pub subprocess_timeout_secs: u64,
@@ -100,14 +112,16 @@ impl Default for WikiLoopConfig {
             queue_dir: state_dir.join("queue"),
             state_db: state_dir.join("state.db"),
             wiki_root: memex_root.join("wiki"),
-            wiki_staging: state_dir.join("wiki-staging"),
             skills_root: dirs_next_home()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join(".agents/skills"),
             proposals_dir: state_dir.join("proposals"),
+            workspace_root: None,
             quiet_minutes: 20,
             min_turns: 3,
             max_batch_size: 10,
+            max_failing_sessions: 5,
+            max_passing_sessions: 3,
             max_chars_per_session: 24 * 1024,
             max_chars_per_batch: 160 * 1024,
             subprocess_timeout_secs: 1200,
@@ -132,12 +146,14 @@ struct ConfigFile {
     queue_dir: Option<String>,
     state_db: Option<String>,
     wiki_root: Option<String>,
-    wiki_staging: Option<String>,
     skills_root: Option<String>,
     proposals_dir: Option<String>,
+    workspace_root: Option<String>,
     quiet_minutes: Option<i64>,
     min_turns: Option<i64>,
     max_batch_size: Option<usize>,
+    max_failing_sessions: Option<usize>,
+    max_passing_sessions: Option<usize>,
     max_chars_per_session: Option<usize>,
     max_chars_per_batch: Option<usize>,
     subprocess_timeout_secs: Option<u64>,
@@ -174,6 +190,15 @@ impl WikiLoopConfig {
         let file: ConfigFile =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
+        // The workspace root re-bases the wiki and skills defaults; explicit
+        // wiki_root / skills_root keys below still win.
+        if let Some(v) = &file.workspace_root {
+            let root = expand_home(Path::new(v))?;
+            cfg.workspace_root = Some(root.clone());
+            cfg.wiki_root = root.join("wiki");
+            cfg.skills_root = root.join("skills");
+        }
+
         macro_rules! expand {
             ($field:expr, $value:expr) => {
                 if let Some(v) = $value {
@@ -184,7 +209,6 @@ impl WikiLoopConfig {
         expand!(cfg.queue_dir, file.queue_dir);
         expand!(cfg.state_db, file.state_db);
         expand!(cfg.wiki_root, file.wiki_root);
-        expand!(cfg.wiki_staging, file.wiki_staging);
         expand!(cfg.skills_root, file.skills_root);
         expand!(cfg.proposals_dir, file.proposals_dir);
 
@@ -196,6 +220,12 @@ impl WikiLoopConfig {
         }
         if let Some(v) = file.max_batch_size {
             cfg.max_batch_size = v;
+        }
+        if let Some(v) = file.max_failing_sessions {
+            cfg.max_failing_sessions = v;
+        }
+        if let Some(v) = file.max_passing_sessions {
+            cfg.max_passing_sessions = v;
         }
         if let Some(v) = file.max_chars_per_session {
             cfg.max_chars_per_session = v;
@@ -233,13 +263,18 @@ impl WikiLoopConfig {
         Ok(cfg)
     }
 
-    /// Wiki directory a maintainer run should write to.
-    pub fn wiki_dir(&self, live: bool) -> PathBuf {
-        if live {
-            self.wiki_root.clone()
-        } else {
-            self.wiki_staging.clone()
-        }
+    /// Materialize an embedded output schema for this run and return its path, for roles
+    /// configured with `json_schema = true` (harnesses that enforce structured output).
+    pub fn schema_path(&self, role: &str, content: &str) -> Result<PathBuf> {
+        let dir = self
+            .state_db
+            .parent()
+            .context("state db has no parent directory")?
+            .join("schemas");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{role}.json"));
+        std::fs::write(&path, content)?;
+        Ok(path)
     }
 
     /// Path to memex's analytics store for read-only session metadata lookups.
@@ -273,8 +308,11 @@ mod tests {
         let cfg = WikiLoopConfig::default();
         assert_eq!(cfg.min_pattern_corroboration, 2);
         assert!(cfg.quiet_minutes > 0);
+        // Paper Appendix C stratification: up to 5 failing + 3 passing traces.
+        assert_eq!((cfg.max_failing_sessions, cfg.max_passing_sessions), (5, 3));
         assert!(cfg.maintainer.json_schema);
         assert!(!cfg.proposer.json_schema);
+        assert!(cfg.workspace_root.is_none());
         assert!(cfg.state_db.starts_with(dirs_next_home().unwrap()));
     }
 
@@ -302,5 +340,37 @@ mod tests {
         assert_eq!(cfg.max_batch_size, 4);
         assert_eq!(cfg.maintainer.model, "stub");
         assert!(!cfg.maintainer.json_schema);
+    }
+
+    #[test]
+    fn workspace_root_rebases_wiki_and_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("wiki-loop.toml");
+        std::fs::write(&path, "workspace_root = \"/apps\"").expect("write config");
+        let cfg = WikiLoopConfig::load(Some(&path)).expect("load");
+        assert_eq!(cfg.workspace_root, Some(PathBuf::from("/apps")));
+        assert_eq!(cfg.wiki_root, PathBuf::from("/apps/wiki"));
+        assert_eq!(cfg.skills_root, PathBuf::from("/apps/skills"));
+
+        // Explicit path keys win over the workspace-root defaults.
+        std::fs::write(
+            &path,
+            "workspace_root = \"/apps\"\nskills_root = \"/opt/skills\"\n",
+        )
+        .expect("write config");
+        let cfg = WikiLoopConfig::load(Some(&path)).expect("load");
+        assert_eq!(cfg.wiki_root, PathBuf::from("/apps/wiki"));
+        assert_eq!(cfg.skills_root, PathBuf::from("/opt/skills"));
+    }
+
+    #[test]
+    fn workspace_root_expands_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("wiki-loop.toml");
+        std::fs::write(&path, "workspace_root = \"~/work\"").expect("write config");
+        let cfg = WikiLoopConfig::load(Some(&path)).expect("load");
+        let home = dirs_next_home().expect("HOME");
+        assert_eq!(cfg.wiki_root, home.join("work/wiki"));
+        assert_eq!(cfg.skills_root, home.join("work/skills"));
     }
 }

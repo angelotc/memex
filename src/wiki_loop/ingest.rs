@@ -108,9 +108,20 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
     })
 }
 
+/// A session's records are complete when they cover at least the message count the
+/// analytics store already attributes to the session. The index commits in batches, so
+/// a lagging index legitimately returns fewer — callers must treat that as "not ready",
+/// never as "no errors".
+pub fn records_complete(records: &[Record], meta: &SessionMeta) -> bool {
+    !records.is_empty() && records.len() as i64 >= meta.message_count
+}
+
 /// Load a session's turn records: primary path is memex's own index
 /// (`SearchIndex::records_by_session_id`); fallback re-parses the raw transcript file
-/// for sources with JSONL parsers. Records are sorted into causal order.
+/// for sources with JSONL parsers. An index read that returns a partial (or empty)
+/// set for a session the analytics store knows about also triggers the fallback —
+/// `records_by_session_id` cannot distinguish "not yet committed" from "no records".
+/// Records are sorted into causal order.
 pub fn load_records(index_dir: &Path, meta: &SessionMeta) -> Result<Vec<Record>> {
     let mut records = match crate::index::SearchIndex::open_or_create(index_dir) {
         Ok(idx) => match idx.records_by_session_id(&meta.session_id) {
@@ -131,6 +142,15 @@ pub fn load_records(index_dir: &Path, meta: &SessionMeta) -> Result<Vec<Record>>
             parse_raw_transcript(meta)?
         }
     };
+    if !records_complete(&records, meta) {
+        // Partial index read: the raw transcript is the authoritative source for an
+        // ended session. Keep whichever yields more records.
+        if let Ok(raw) = parse_raw_transcript(meta)
+            && raw.len() > records.len()
+        {
+            records = raw;
+        }
+    }
     records.sort_by_key(|r| (r.ts, r.turn_id));
     Ok(records)
 }

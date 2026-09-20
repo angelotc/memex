@@ -121,13 +121,12 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
     } else {
         None
     };
-    let raw = super::harness::run_role(
+    let value = super::harness::run_role_structured(
         &cfg.proposer,
         &prompt,
         schema.as_deref(),
         std::time::Duration::from_secs(cfg.subprocess_timeout_secs),
     )?;
-    let value = super::harness::extract_json_object(&raw)?;
     let out: ProposerOutput = serde_json::from_value(value).context("parsing proposer JSON")?;
 
     let Some(skill_name) = out.skill_name else {

@@ -364,13 +364,12 @@ fn execute_maintainer(
         } else {
             None
         };
-        let raw = harness::run_role(
+        let value = harness::run_role_structured(
             &cfg.maintainer,
             &prompt,
             schema.as_deref(),
             std::time::Duration::from_secs(cfg.subprocess_timeout_secs),
         )?;
-        let value = harness::extract_json_object(&raw)?;
         #[derive(serde::Deserialize)]
         struct MaintainerOutput {
             // No serde default: output without a `patterns` key is a malformed response,

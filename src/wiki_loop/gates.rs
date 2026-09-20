@@ -455,13 +455,12 @@ pub fn tier1(
     } else {
         None
     };
-    let raw = super::harness::run_role(
+    let value = super::harness::run_role_structured(
         &cfg.judge,
         &prompt,
         schema.as_deref(),
         std::time::Duration::from_secs(cfg.subprocess_timeout_secs),
     )?;
-    let value = super::harness::extract_json_object(&raw)?;
     if value
         .get("assessments")
         .and_then(|v| v.as_array())

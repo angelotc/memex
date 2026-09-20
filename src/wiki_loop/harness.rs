@@ -39,6 +39,48 @@ pub fn build_args(role: &RoleConfig, schema_path: Option<&std::path::Path>) -> R
     Ok(args)
 }
 
+/// Run a role and extract a structured JSON verdict, retrying once when the output has
+/// the right shape problem but the wrong content — the observed failure mode is a
+/// frontier model drifting into prose (schema enforcement is best-effort in the
+/// harness), which a single re-ask reliably absorbs. Harness errors (spawn, timeout,
+/// non-zero exit) are not retried: those are systematic, and retrying a timeout just
+/// doubles the stall. The final error names the envelope status and keys so the
+/// circuit breaker's message is diagnosable from `status` alone.
+pub fn run_role_structured(
+    role: &RoleConfig,
+    prompt: &str,
+    schema_path: Option<&std::path::Path>,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut last_err = None;
+    for _ in 0..2 {
+        let raw = run_role(role, prompt, schema_path, timeout)?;
+        match extract_json_object(&raw) {
+            Ok(v) if !is_leaked_envelope(&v) => return Ok(v),
+            Ok(v) => {
+                // Envelope fell through unwrapped: the model's answer held no JSON.
+                let status = v.get("status").and_then(Value::as_str).unwrap_or("unknown");
+                last_err = Some(anyhow::anyhow!(
+                    "model output carried no JSON (harness status `{status}`, keys {:?})",
+                    v.as_object()
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                ));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
+/// An unwrapped `agy`/`claude` envelope: `extract_json_object` returned the envelope
+/// itself because the answer field held no parseable object. Callers expecting a domain
+/// schema would fail on it anyway — better to name and retry the shape problem.
+fn is_leaked_envelope(v: &Value) -> bool {
+    v.get("conversation_id").is_some() && v.get("response").is_some()
+        || v.get("type").is_some() && v.get("result").is_some()
+}
+
 /// Run a role with `prompt` on stdin; return raw stdout. On timeout (or wait failure)
 /// kills the child's whole process group — wrapper CLIs spawn grandchildren that must
 /// not outlive the kill.
@@ -287,6 +329,51 @@ mod tests {
         let start = Instant::now();
         assert!(run_role(&slow, "", None, Duration::from_secs(1)).is_err());
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn structured_output_retries_once_on_envelope_drift() {
+        // First call: agy envelope whose response is prose (the observed drift mode).
+        // Second call: clean domain JSON. One retry must absorb it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("drift");
+        std::fs::write(&marker, b"1").expect("marker");
+        let script = format!(
+            "cat > /dev/null; if [ -f {m} ]; then rm {m}; printf '%s' '{drift}'; else printf '%s' '{ok}'; fi",
+            m = marker.display(),
+            drift = r#"{"conversation_id":"abc","status":"SUCCESS","response":"I shall summarize these patterns in prose instead.","duration_seconds":1.0}"#,
+            ok = r#"{"patterns": []}"#
+        );
+        let r = role(&["sh", "-c", &script]);
+        let v =
+            run_role_structured(&r, "prompt", None, Duration::from_secs(30)).expect("structured");
+        assert!(v.get("patterns").is_some());
+    }
+
+    #[test]
+    fn structured_output_fails_naming_status_after_persistent_drift() {
+        let script = format!(
+            "cat > /dev/null; printf '%s' '{drift}'",
+            drift = r#"{"conversation_id":"abc","status":"MAX_TURNS","response":"ran out of turns","num_turns":8}"#
+        );
+        let r = role(&["sh", "-c", &script]);
+        let err =
+            run_role_structured(&r, "prompt", None, Duration::from_secs(30)).expect_err("fails");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no JSON"), "{msg}");
+        assert!(msg.contains("MAX_TURNS"), "{msg}");
+    }
+
+    #[test]
+    fn envelope_leak_detection_covers_agy_and_claude_shapes() {
+        let agy = serde_json::json!({"conversation_id": "x", "response": "prose"});
+        let claude = serde_json::json!({"type": "result", "result": "prose"});
+        let domain = serde_json::json!({"patterns": []});
+        // A claude envelope whose result legitimately IS the verdict object unwraps
+        // before this check ever sees it; what remains is prose-only envelopes.
+        assert!(is_leaked_envelope(&agy));
+        assert!(is_leaked_envelope(&claude));
+        assert!(!is_leaked_envelope(&domain));
     }
 
     #[test]

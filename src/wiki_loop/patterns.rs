@@ -277,9 +277,9 @@ impl PatternStore {
         let mut op = op.clone();
         op.slug = slug;
         match op.action.as_str() {
-            "create" => self.create(op, &scrubbed, evidence),
-            "merge" => self.merge(op, &scrubbed, evidence),
-            "supersede" => self.supersede(op, &scrubbed, evidence),
+            "create" => self.create(&op, &scrubbed, evidence),
+            "merge" => self.merge(&op, &scrubbed, evidence),
+            "supersede" => self.supersede(&op, &scrubbed, evidence),
             other => bail!("unknown pattern action `{other}`"),
         }
     }

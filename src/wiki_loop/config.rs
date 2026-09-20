@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// How to invoke one agent role. The prompt is always piped via stdin; `{model}`, `{effort}`,
 /// and `{schema}` placeholders in `command` args are substituted before exec.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RoleConfig {
     /// argv vector; element 0 is the program. Supports `{model}` / `{effort}` / `{schema}`.
     #[serde(default)]
@@ -61,7 +61,7 @@ impl RoleConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WikiLoopConfig {
     pub queue_dir: PathBuf,
     pub state_db: PathBuf,
@@ -382,5 +382,20 @@ mod tests {
         let home = dirs_next_home().expect("HOME");
         assert_eq!(cfg.wiki_root, home.join("work/wiki"));
         assert_eq!(cfg.skills_root, home.join("work/skills"));
+    }
+
+    /// docs/wiki-loop.example.toml is the complete annotated reference: it must
+    /// parse, and loading it must reproduce the code defaults exactly — otherwise
+    /// the documented example has drifted from the binary.
+    #[test]
+    fn example_config_matches_code_defaults() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/wiki-loop.example.toml");
+        let cfg = WikiLoopConfig::load(Some(&path)).expect("docs/wiki-loop.example.toml parses");
+        assert_eq!(
+            cfg,
+            WikiLoopConfig::default(),
+            "docs/wiki-loop.example.toml has drifted from src/wiki_loop/config.rs defaults"
+        );
     }
 }

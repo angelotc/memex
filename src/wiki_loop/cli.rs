@@ -871,7 +871,8 @@ fn run_init(workspace: Option<PathBuf>, force: bool, install_cron: bool) -> Resu
             .unwrap_or_default();
         let template = format!(
             "# wiki-loop configuration. Everything here is optional — defaults live in\n\
-             # the binary; this file only overrides. Docs: docs/wiki-loop.md.\n\
+             # the binary; this file only overrides. Every parameter is documented with\n\
+             # its default in docs/wiki-loop.example.toml; docs: docs/wiki-loop.md.\n\
              {workspace_line}\
              # Sampling and budgets (defaults shown):\n\
              # quiet_minutes          = 20    # quiet window before a session is compiled\n\

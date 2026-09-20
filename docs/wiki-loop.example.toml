@@ -1,0 +1,91 @@
+# wiki-loop example configuration — every parameter, set to its default.
+#
+# Copy to ~/.memex/wiki-loop.toml and change what you need; anything you delete
+# falls back to these same defaults (they live in src/wiki_loop/config.rs). A
+# unit test keeps this file in sync with the code: if a default changes there,
+# this file must change with it.
+#
+# Keys unknown to your binary version are ignored, so an older install can read
+# a newer example safely.
+
+# ---- paths ---------------------------------------------------------------------
+
+# Optional workspace root: one shared wiki + skills base for every project under
+# it (e.g. /apps -> /apps/wiki and /apps/skills). Per-project attribution rides
+# on `project:<name>` scope stamps, not partitioned stores. Explicit wiki_root /
+# skills_root keys below still win over the workspace defaults. Uncomment on a
+# workspace box:
+#workspace_root = "/apps"
+
+wiki_root     = "~/.memex/wiki"                  # patterns/, index.md, logs.md, skill-impact.md
+skills_root   = "~/.agents/skills"               # applied skills land here (<name>/SKILL.md)
+queue_dir     = "~/.local/state/wiki-loop/queue"
+state_db      = "~/.local/state/wiki-loop/state.db"
+proposals_dir = "~/.local/state/wiki-loop/proposals"
+
+# ---- sampling --------------------------------------------------------------------
+
+quiet_minutes         = 20   # a session must be quiet this long after ending
+collect_lookback_days = 7    # collector sweep horizon for ended sessions (0 = all history)
+min_turns             = 3    # skip trivial sessions
+max_batch_size        = 10   # sessions claimed per maintainer run, before stratification
+
+# ---- stratification (paper Appendix C ratio) --------------------------------------
+
+max_failing_sessions  = 5    # failing traces per run, for root-cause analysis
+max_passing_sessions  = 3    # passing traces per run, for strategy extraction
+
+# ---- budgets and ceilings -----------------------------------------------------------
+
+max_chars_per_session     = 24576   # per-session summary cap (chars)
+max_chars_per_batch       = 163840  # per stratum (failing and passing each get this)
+subprocess_timeout_secs   = 1200    # one role invocation before the process-group kill
+max_proposals_per_week    = 3       # precision over recall: a quiet proposer is trusted
+min_pattern_corroboration = 2       # distinct sessions before a pattern can motivate a skill
+tier1_sessions            = 5       # historical sessions the counterfactual judge inspects
+
+# ---- notifications -------------------------------------------------------------------
+
+notify_on_proposal = true
+notify_on_failure  = true
+
+# ---- roles -----------------------------------------------------------------------------
+
+# Each role is an argv template; the prompt is piped via stdin and `{model}`,
+# `{effort}`, and `{schema}` are substituted per argument. `json_schema = true`
+# appends `--json-schema <path>` for harnesses that enforce structured output
+# (the schemas are embedded in the binary and materialized per run). Output that
+# still drifts out of JSON is retried once before failing the run.
+#
+# Defaults: the maintainer runs on agy, the proposer and judge on claude (opus).
+
+[maintainer]
+command = ["agy", "--output-format", "json", "--model", "{model}", "--effort", "{effort}"]
+model = "gemini-3.8-flash"
+effort = "low"
+json_schema = true
+
+[proposer]
+command = ["claude", "-p", "--output-format", "json", "--model", "{model}"]
+model = "opus"
+effort = ""
+json_schema = false
+
+[judge]
+command = ["claude", "-p", "--output-format", "json", "--model", "{model}"]
+model = "opus"
+effort = ""
+json_schema = false
+
+# ---- profile: 1M-context maintainer ---------------------------------------------------
+# What a machine with a 1M-context maintainer model runs instead (the live
+# profile on the /apps box). Worst-case digest ≈ 2 × max_chars_per_batch ≈ 1.6M
+# chars ≈ 400K tokens, leaving room for wiki pages, harness overhead, and the
+# JSON output. Replace the sampling/stratification/budget values above with:
+#
+# max_batch_size          = 40
+# max_failing_sessions    = 25
+# max_passing_sessions    = 15
+# max_chars_per_session   = 98304
+# max_chars_per_batch     = 819200
+# subprocess_timeout_secs = 2400

@@ -213,9 +213,12 @@ One wiki and one skills directory back every project under the workspace root
 (`/apps/wiki`, `/apps/skills`); patterns and proposals carry `project:<name>` scope
 stamps, and cross-project evidence widens a proposal to global only under the strictest
 gates. Browse the compiled wiki from the TUI with `alt+w`, and the deployed skills with
-`s` from there.
-See [the wiki-loop guide](docs/wiki-loop.md) for the loop, its deliberate divergences
-from the paper, and operations.
+`s` from there. Every configuration parameter — paths, sampling, stratification,
+budgets, roles — is documented with its default in
+[docs/wiki-loop.example.toml](docs/wiki-loop.example.toml); copy it to
+`~/.memex/wiki-loop.toml` and change what you need (a test keeps the file in sync
+with the binary's defaults). See [the wiki-loop guide](docs/wiki-loop.md) for the
+loop, its deliberate divergences from the paper, and operations.
 
 ## Multiple machines over SSH
 

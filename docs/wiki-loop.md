@@ -138,6 +138,9 @@ reversible.
 ## Configuration
 
 Optional, at `~/.memex/wiki-loop.toml`. Defaults apply when the file is absent.
+The complete annotated reference — every parameter with its default, plus a
+1M-context profile — is [wiki-loop.example.toml](wiki-loop.example.toml); a unit
+test asserts it stays in sync with the binary's defaults. The essentials:
 
 ```toml
 # Paths

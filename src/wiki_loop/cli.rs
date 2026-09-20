@@ -48,6 +48,10 @@ pub enum WikiLoopCommand {
         /// Build the prompt and digest but do not invoke the maintainer model or write
         #[arg(long)]
         dry_run: bool,
+        /// Attempt one run even while the circuit breaker is tripped (after fixing the
+        /// cause). A failed forced run leaves the breaker tripped.
+        #[arg(long)]
+        force: bool,
     },
     /// Run the Skill Proposer: stage at most one atomic skill proposal per run
     RunProposer {
@@ -90,7 +94,7 @@ pub fn run(command: WikiLoopCommand) -> Result<()> {
             println!("enqueued {}:{} -> {}", source, session_id, path.display());
             Ok(())
         }
-        WikiLoopCommand::RunMaintainer { dry_run } => {
+        WikiLoopCommand::RunMaintainer { dry_run, force } => {
             let cfg = WikiLoopConfig::load(None)?;
             // The wiki lock serializes against the proposer so it never reads a wiki
             // mid-write; the role lock prevents overlapping maintainer crons.
@@ -101,7 +105,7 @@ pub fn run(command: WikiLoopCommand) -> Result<()> {
                     return Ok(());
                 }
             };
-            run_maintainer(&cfg, dry_run)
+            run_maintainer(&cfg, dry_run, force)
         }
         WikiLoopCommand::RunProposer { dry_run } => {
             let cfg = WikiLoopConfig::load(None)?;
@@ -167,13 +171,14 @@ fn acquire_locks(cfg: &WikiLoopConfig, roles: &[&str]) -> Result<Vec<RoleLock>> 
         .collect()
 }
 
-fn run_maintainer(cfg: &WikiLoopConfig, dry_run: bool) -> Result<()> {
+fn run_maintainer(cfg: &WikiLoopConfig, dry_run: bool, force: bool) -> Result<()> {
     let ledger = StateLedger::open(&cfg.state_db)?;
 
     // Circuit breaker: after 3 consecutive maintainer failures, stay quiet and notify
-    // instead of burning model budget every cron tick.
+    // instead of burning model budget every cron tick. `--force` buys exactly one
+    // attempt after the operator has fixed the cause; a failure keeps it tripped.
     let failures = ledger.consecutive_failures("maintainer")?;
-    if failures >= 3 && !dry_run {
+    if failures >= 3 && !dry_run && !force {
         let msg = format!(
             "maintainer disabled after {failures} consecutive failures; inspect `memex wiki-loop status`"
         );

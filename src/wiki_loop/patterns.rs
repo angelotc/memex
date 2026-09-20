@@ -267,13 +267,15 @@ impl PatternStore {
         scrubbed: &PatternOp,
         evidence: &[Corroboration],
     ) -> Result<PatternWrite> {
-        if !is_valid_slug(&op.slug) {
-            bail!("invalid pattern slug `{}`", op.slug);
-        }
-        // Downstream paths are built from the scrubbed copy; pin it to the validated
+        let Some(slug) = normalize_slug(&op.slug) else {
+            bail!("pattern slug `{}` normalizes to nothing", op.slug);
+        };
+        // Downstream paths are built from the scrubbed copy; pin it to the normalized
         // slug so a divergence between the two can never reach the filesystem.
         let mut scrubbed = scrubbed.clone();
-        scrubbed.slug = op.slug.clone();
+        scrubbed.slug = slug.clone();
+        let mut op = op.clone();
+        op.slug = slug;
         match op.action.as_str() {
             "create" => self.create(op, &scrubbed, evidence),
             "merge" => self.merge(op, &scrubbed, evidence),
@@ -612,6 +614,37 @@ pub fn is_valid_slug(slug: &str) -> bool {
         && !slug.ends_with('-')
 }
 
+/// Sanitize a model-emitted slug into a valid one: lowercase, dashes for anything
+/// else, collapsed and trimmed, truncated to the 80-char cap on a dash boundary.
+/// Over-long descriptive slugs are the normal model failure (verbosity, not malice)
+/// — truncating keeps the pattern instead of dropping the op. None when nothing
+/// usable remains.
+pub fn normalize_slug(raw: &str) -> Option<String> {
+    let mut slug: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    if slug.len() > 80 {
+        slug.truncate(80);
+        // Cut on a word boundary and never end on a dangling dash.
+        if let Some(cut) = slug.rfind('-') {
+            slug.truncate(cut);
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    (!slug.is_empty()).then_some(slug)
+}
+
 pub fn generate_pattern_id() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -668,6 +701,32 @@ pub fn scrub_op(op: &PatternOp) -> (PatternOp, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_slug_cleans_and_truncates() {
+        // The live failure mode: a descriptive slug past the 80-char cap.
+        let long =
+            "gsc-api-query-fails-with-403-forbidden-on-domain-properties-without-sc-domain-prefix";
+        let normalized = normalize_slug(long).expect("normalizes");
+        assert!(is_valid_slug(&normalized), "{normalized}");
+        // Truncation lands on a word boundary, not mid-word or on a dangling dash.
+        assert!(normalized.len() <= 80);
+        assert!(normalized.starts_with("gsc-api-query-fails-with-403-forbidden"));
+
+        // Dirty input: case, separators, runs, surrounding dashes.
+        assert_eq!(
+            normalize_slug("  Way Too--Messy_SLUG!! "),
+            Some("way-too-messy-slug".into())
+        );
+        // Already-valid slugs pass through untouched.
+        assert_eq!(
+            normalize_slug("wrangler-erofs-log-failure").as_deref(),
+            Some("wrangler-erofs-log-failure")
+        );
+        // Nothing usable remains.
+        assert_eq!(normalize_slug("---___***---"), None);
+        assert_eq!(normalize_slug(""), None);
+    }
 
     fn op(action: &str, slug: &str, sessions: &[&str]) -> PatternOp {
         PatternOp {

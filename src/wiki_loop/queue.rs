@@ -74,14 +74,29 @@ impl QueueManager {
         ))
     }
 
-    /// Atomically enqueue or upsert a session event. Re-enqueueing an existing session
-    /// refreshes `last_event_at` and preserves retry bookkeeping (idempotent upsert).
+    /// Atomically enqueue or upsert a session event, stamping the event at the current
+    /// time (hook calls; see `enqueue_event` for the collector's analytics-time stamp).
     pub fn enqueue(
         &self,
         source: &str,
         session_id: &str,
         project_hint: Option<&str>,
         ended: bool,
+    ) -> Result<PathBuf> {
+        self.enqueue_event(source, session_id, project_hint, ended, now_ms())
+    }
+
+    /// Enqueue with an explicit event timestamp (the session's real `last_at` from
+    /// analytics). `last_event_at` only ever moves forward across upserts, so a sweep
+    /// cannot extend an entry's quiet window backwards, and `ended` is sticky. Re-enqueue
+    /// preserves retry bookkeeping (idempotent upsert).
+    pub fn enqueue_event(
+        &self,
+        source: &str,
+        session_id: &str,
+        project_hint: Option<&str>,
+        ended: bool,
+        last_event_at: i64,
     ) -> Result<PathBuf> {
         let path = self.entry_path(source, session_id);
         let existing: Option<QueueEntry> = self.read_entry(&path);
@@ -95,12 +110,22 @@ impl QueueManager {
                 .map(str::to_string)
                 .or_else(|| existing.as_ref().and_then(|e| e.project_hint.clone())),
             enqueued_at: existing.as_ref().map(|e| e.enqueued_at).unwrap_or(now),
-            last_event_at: now,
+            last_event_at: existing
+                .as_ref()
+                .map(|e| e.last_event_at.max(last_event_at))
+                .unwrap_or(last_event_at),
             ended: ended || existing.as_ref().is_some_and(|e| e.ended),
             attempts: existing.as_ref().map(|e| e.attempts).unwrap_or(0),
             next_retry_at: existing.as_ref().map(|e| e.next_retry_at).unwrap_or(0),
             last_error: existing.as_ref().and_then(|e| e.last_error.clone()),
         };
+        // The collector sweep re-visits every uncompiled session each run; when nothing
+        // observable changed (same fingerprint), skip the disk churn entirely.
+        if let Some(existing) = &existing
+            && entry_fingerprint(&entry) == entry_fingerprint(existing)
+        {
+            return Ok(path);
+        }
         self.write_atomic(&path, &entry)?;
         Ok(path)
     }
@@ -270,6 +295,64 @@ mod tests {
         qm.enqueue("claude", "s1", None, true).expect("end");
         let e = qm.read_entry(&path).expect("entry");
         assert!(e.ended);
+    }
+
+    #[test]
+    fn enqueue_event_moves_last_event_at_forward_only() {
+        let (qm, _tmp) = manager();
+        // A hook stamped the session at wall-clock T; the sweep knows the session's
+        // analytics last_at is slightly earlier — the earlier stamp must not win.
+        let now = now_ms();
+        qm.enqueue_event("claude", "s1", None, true, now)
+            .expect("enqueue at hook time");
+        qm.enqueue_event("claude", "s1", None, true, now - 5_000)
+            .expect("sweep with analytics last_at");
+        let path = qm.entry_path("claude", "s1");
+        let e = qm.read_entry(&path).expect("entry");
+        assert_eq!(e.last_event_at, now);
+
+        // A resumed session pushes the stamp forward and re-opens compilation.
+        qm.enqueue_event("claude", "s1", None, true, now + 60_000)
+            .expect("resume");
+        let e = qm.read_entry(&path).expect("entry");
+        assert_eq!(e.last_event_at, now + 60_000);
+    }
+
+    #[test]
+    fn identical_upsert_skips_the_write() {
+        let (qm, _tmp) = manager();
+        let now = now_ms();
+        qm.enqueue_event("claude", "s1", None, true, now)
+            .expect("enqueue");
+        let path = qm.entry_path("claude", "s1");
+        let mtime = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        // The sweep revisits the same session next run: nothing observable changed,
+        // so the file must not be rewritten.
+        qm.enqueue_event("claude", "s1", None, true, now)
+            .expect("sweep no-op");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("stat")
+                .modified()
+                .expect("mtime"),
+            mtime
+        );
+
+        // A newer event still writes.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        qm.enqueue_event("claude", "s1", None, true, now + 1)
+            .expect("sweep with new event");
+        assert_ne!(
+            std::fs::metadata(&path)
+                .expect("stat")
+                .modified()
+                .expect("mtime"),
+            mtime
+        );
     }
 
     #[test]

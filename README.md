@@ -194,6 +194,28 @@ Memex also serves authenticated Streamable HTTP with `memex mcp`, or alongside
 background indexing with `memex daemon enable --mcp`. See the [MCP guide](docs/mcp.md)
 for client setup, OAuth, remote access, and the retrieval tool contracts.
 
+## Compounding skills from experience
+
+`memex wiki-loop` turns indexed sessions into a compounding wiki of failure and success
+patterns, and from the corroborated ones proposes versioned skills that stage for human
+approval — the three-layer loop from
+[WikiSkill](https://arxiv.org/abs/2608.27454) (raw traces → wiki → skills) adapted for
+production traces: orchestrator-owned writes, secret scrubbing, tiered validation gates,
+and rollback for every applied skill.
+
+```bash
+memex wiki-loop init --workspace /apps --install-cron   # scaffold + schedule, no model calls
+memex wiki-loop run-maintainer                          # sweep ended sessions, compile patterns
+memex wiki-loop status                                  # queue, wiki growth, health
+```
+
+One wiki and one skills directory back every project under the workspace root
+(`/apps/wiki`, `/apps/skills`); patterns and proposals carry `project:<name>` scope
+stamps, and cross-project evidence widens a proposal to global only under the strictest
+gates. Browse the compiled wiki and deployed skills read-only from the TUI with `w`.
+See [the wiki-loop guide](docs/wiki-loop.md) for the loop, its deliberate divergences
+from the paper, and operations.
+
 ## Multiple machines over SSH
 
 Each machine keeps its own index. Memex queries configured machines over SSH and
@@ -268,5 +290,6 @@ destination can reproduce the original session's behavior.
 | [Multiple machines](docs/machines.md) | SSH setup, remote reads, batch retrieval |
 | [MCP server](docs/mcp.md) | Transports, authentication, client setup, retrieval tools |
 | [Token usage](docs/usage.md) | Counters, pricing, cache estimates, Hermes coverage |
+| [wiki-loop](docs/wiki-loop.md) | Compiling sessions into a wiki and versioned skills |
 | [herdr integration](docs/herdr.md) | Installation, actions, key bindings |
 | [Developer profiling](docs/profiling.md) | Index/search traces and flamegraphs |

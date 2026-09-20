@@ -77,6 +77,10 @@ pub struct WikiLoopConfig {
     pub workspace_root: Option<PathBuf>,
     /// Quiet window a session must sit through (after ending) before the maintainer claims it.
     pub quiet_minutes: i64,
+    /// How far back the collector sweep looks for ended-but-uncompiled sessions, in days.
+    /// 0 means unlimited. Bounds the first-run backlog so a long analytics history does
+    /// not turn into an unbounded compile bill.
+    pub collect_lookback_days: i64,
     /// Sessions with fewer analytics turns than this are skipped as trivial.
     pub min_turns: i64,
     /// Sessions claimed per maintainer run, before stratification.
@@ -118,6 +122,7 @@ impl Default for WikiLoopConfig {
             proposals_dir: state_dir.join("proposals"),
             workspace_root: None,
             quiet_minutes: 20,
+            collect_lookback_days: 7,
             min_turns: 3,
             max_batch_size: 10,
             max_failing_sessions: 5,
@@ -150,6 +155,7 @@ struct ConfigFile {
     proposals_dir: Option<String>,
     workspace_root: Option<String>,
     quiet_minutes: Option<i64>,
+    collect_lookback_days: Option<i64>,
     min_turns: Option<i64>,
     max_batch_size: Option<usize>,
     max_failing_sessions: Option<usize>,
@@ -167,17 +173,18 @@ struct ConfigFile {
     notify_on_failure: Option<bool>,
 }
 
+/// Default config location: `~/.memex/wiki-loop.toml`.
+pub fn default_config_path() -> Result<PathBuf> {
+    let home = dirs_next_home().context("HOME not set; cannot locate ~/.memex/wiki-loop.toml")?;
+    Ok(home.join(".memex/wiki-loop.toml"))
+}
+
 impl WikiLoopConfig {
     /// Load config from an explicit path, or `~/.memex/wiki-loop.toml` when present.
     pub fn load(override_path: Option<&Path>) -> Result<Self> {
         let path = match override_path {
             Some(p) => Some(p.to_path_buf()),
-            None => {
-                let candidate = dirs_next_home()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join(".memex/wiki-loop.toml");
-                candidate.exists().then_some(candidate)
-            }
+            None => default_config_path().ok().filter(|p| p.exists()),
         };
 
         let mut cfg = Self::default();
@@ -214,6 +221,9 @@ impl WikiLoopConfig {
 
         if let Some(v) = file.quiet_minutes {
             cfg.quiet_minutes = v;
+        }
+        if let Some(v) = file.collect_lookback_days {
+            cfg.collect_lookback_days = v;
         }
         if let Some(v) = file.min_turns {
             cfg.min_turns = v;

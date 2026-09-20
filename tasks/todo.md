@@ -73,6 +73,18 @@ i want the root /apps to be the wiki and skilsl base."
       divergences, unredacted-traces-to-models note).
 - [x] Commit (no attribution lines, per repo rule).
 
+## Collector + install UX (user goal)
+
+- [x] `collect.rs` sweep: ended (quiet ≥ quiet window), uncompiled, inside
+      `collect_lookback_days` (default 7, 0 = all) sessions enqueue themselves from
+      analytics before each maintainer run — no per-harness hooks needed. Entry stamps
+      carry the session's real `last_at`; identical upserts skip the disk write.
+- [x] `wiki-loop init [--workspace] [--install-cron] [--force]`: scaffold config
+      (defaults live in the binary), create wiki/skills dirs, install the marked cron
+      block via `crontab -` (idempotent splice of its own BEGIN/END block), run doctor.
+- [x] README section + docs install section; Reference table row.
+- [ ] TUI wiki/skills browser (`w`) — in flight via subagent.
+
 ## Review
 
 All 22 review findings addressed (F1–F22). Verification: `cargo fmt --check` clean,

@@ -18,7 +18,8 @@ use crate::types::Record;
 
 #[derive(Debug, Subcommand)]
 pub enum WikiLoopCommand {
-    /// Enqueue a session event for compilation (call from session-end hooks; <10ms)
+    /// Enqueue a session event for compilation (optional; the maintainer's collector
+    /// sweep also picks up ended sessions from analytics — hooks only buy sub-cron latency)
     Enqueue {
         /// Harness storage label as it appears in analytics (claude, codex, antigravity, ...)
         source: String,
@@ -30,13 +31,25 @@ pub enum WikiLoopCommand {
         #[arg(long)]
         ended: bool,
     },
+    /// Scaffold the config, create the wiki/skills directories, optionally install cron
+    Init {
+        /// Workspace root backing the loop: wiki at <root>/wiki, skills at <root>/skills
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Overwrite an existing config file
+        #[arg(long)]
+        force: bool,
+        /// Install (or replace) the marked crontab block that runs the loop
+        #[arg(long)]
+        install_cron: bool,
+    },
     /// Run the Wiki Maintainer: drain the queue, update patterns, index, and logs
     RunMaintainer {
         /// Build the prompt and digest but do not invoke the maintainer model or write
         #[arg(long)]
         dry_run: bool,
     },
-    /// Run the Skill Proposer: stage at most one atomic skill proposal per store
+    /// Run the Skill Proposer: stage at most one atomic skill proposal per run
     RunProposer {
         #[arg(long)]
         dry_run: bool,
@@ -60,6 +73,11 @@ pub enum WikiLoopCommand {
 
 pub fn run(command: WikiLoopCommand) -> Result<()> {
     match command {
+        WikiLoopCommand::Init {
+            workspace,
+            force,
+            install_cron,
+        } => run_init(workspace, force, install_cron),
         WikiLoopCommand::Enqueue {
             source,
             session_id,
@@ -196,6 +214,13 @@ fn execute_maintainer(
     dry_run: bool,
 ) -> Result<()> {
     let queue = QueueManager::new(&cfg.queue_dir)?;
+    // Collect first (paper step 1): sweep ended-but-uncompiled sessions from analytics
+    // into the queue so the loop needs no per-harness hooks. Idempotent — sessions
+    // already compiled through their current last_at are skipped.
+    let swept = super::collect::sweep(cfg, ledger, &queue)?;
+    if swept > 0 {
+        println!("collector swept {swept} ended session(s) into the queue");
+    }
     let claimed = queue.claim(cfg.max_batch_size, cfg.quiet_minutes)?;
     if claimed.is_empty() {
         ledger.finish_run(run_id, "ok", 0, 0, None)?;
@@ -782,4 +807,171 @@ fn run_doctor(cfg: &WikiLoopConfig) -> Result<()> {
         bail!("doctor found blocking issues");
     }
     Ok(())
+}
+
+/// Scaffold `~/.memex/wiki-loop.toml` (only when absent, unless `--force`), create the
+/// wiki/skills directories, optionally install the cron schedule, then run doctor.
+/// No model calls — safe to run at any time and idempotent.
+fn run_init(workspace: Option<PathBuf>, force: bool, install_cron: bool) -> Result<()> {
+    println!("=== wiki-loop init ===");
+
+    let config_path = super::config::default_config_path()?;
+    if config_path.exists() && !force {
+        println!("[ok] config already present: {}", config_path.display());
+    } else {
+        let workspace_line = workspace
+            .as_ref()
+            .map(|w| format!("workspace_root = \"{}\"\n", w.display()))
+            .unwrap_or_default();
+        let template = format!(
+            "# wiki-loop configuration. Everything here is optional — defaults live in\n\
+             # the binary; this file only overrides. Docs: docs/wiki-loop.md.\n\
+             {workspace_line}\
+             # Sampling and budgets (defaults shown):\n\
+             # quiet_minutes          = 20    # quiet window before a session is compiled\n\
+             # collect_lookback_days  = 7     # sweep horizon for ended sessions (0 = all)\n\
+             # min_turns              = 3     # skip trivial sessions\n\
+             # max_batch_size         = 10    # sessions claimed per maintainer run\n\
+             # max_failing_sessions   = 5     # paper Appendix C stratification\n\
+             # max_passing_sessions   = 3\n\
+             # max_proposals_per_week = 3     # precision over recall\n\n\
+             # Roles default to `agy`; see docs for a claude example:\n\
+             # [maintainer]\n\
+             # command = [\"agy\", \"--output-format\", \"json\", \"--model\", \"{{model}}\", \"--effort\", \"{{effort}}\"]\n\
+             # model = \"gemini-3.8-flash\"\n\
+             # effort = \"low\"\n\
+             # json_schema = true\n"
+        );
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&config_path, template)
+            .with_context(|| format!("writing {}", config_path.display()))?;
+        println!("[ok] wrote config: {}", config_path.display());
+    }
+
+    let cfg = WikiLoopConfig::load(None)?;
+    for dir in [&cfg.wiki_root, &cfg.skills_root] {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        println!("[ok] created: {}", dir.display());
+    }
+
+    if install_cron {
+        install_cron_schedule(&cfg)?;
+    }
+
+    println!("\nnext steps:");
+    println!("  memex wiki-loop run-maintainer   # compile ended sessions now");
+    println!("  memex wiki-loop status           # queue, wiki, health");
+    println!("  memex tui, then `w`              # browse the wiki and skills");
+    run_doctor(&cfg)
+}
+
+/// Install (or replace) the marked crontab block for the loop. The binary that runs is
+/// the one `init` was invoked through (`current_exe`), so cron always runs the exact
+/// build the user just used — including a `memex-wiki-loop` copy pinned for the loop.
+fn install_cron_schedule(cfg: &WikiLoopConfig) -> Result<()> {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "memex".into());
+    let state_dir = cfg
+        .state_db
+        .parent()
+        .context("state db has no parent directory")?;
+    let block = format!(
+        "# BEGIN memex wiki-loop (added by `memex wiki-loop init --install-cron`)\n\
+         */30 * * * * {exe} wiki-loop run-maintainer >> {m} 2>&1\n\
+         17 */6 * * * {exe} wiki-loop run-proposer >> {p} 2>&1\n\
+         # END memex wiki-loop\n",
+        m = state_dir.join("maintainer.log").display(),
+        p = state_dir.join("proposer.log").display(),
+    );
+
+    // `crontab -l` fails when no crontab exists yet — that is an empty starting point.
+    let existing = std::process::Command::new("crontab")
+        .arg("-l")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let merged = splice_cron_block(&existing, &block);
+    let mut child = std::process::Command::new("crontab")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning `crontab -` (is cron installed?)")?;
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(merged.as_bytes())?;
+    }
+    let status = child.wait().context("waiting for crontab")?;
+    if !status.success() {
+        bail!("crontab rejected the new schedule (exit {status})");
+    }
+    println!("[ok] cron installed: maintainer every 30m, proposer every 6h");
+    println!(
+        "     logs under {} — add a logrotate drop-in if they grow (see docs)",
+        state_dir.display()
+    );
+    Ok(())
+}
+
+/// Replace the existing marked block (whole lines between the BEGIN/END markers,
+/// inclusive) or append a fresh one after the current crontab. Idempotent.
+fn splice_cron_block(existing: &str, block: &str) -> String {
+    const BEGIN: &str = "# BEGIN memex wiki-loop";
+    const END: &str = "# END memex wiki-loop";
+    let begin_idx = existing.lines().position(|l| l.starts_with(BEGIN));
+    let end_idx = existing.lines().position(|l| l.starts_with(END));
+    if let (Some(begin), Some(end)) = (begin_idx, end_idx)
+        && begin < end
+    {
+        let mut out: Vec<&str> = existing.lines().collect();
+        out.splice(begin..=end, [block.trim_end()]);
+        out.join("\n") + "\n"
+    } else {
+        let trimmed = existing.trim_end();
+        if trimmed.is_empty() {
+            block.to_string()
+        } else {
+            format!("{trimmed}\n\n{block}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splice_cron_block;
+
+    const BLOCK: &str = "# BEGIN memex wiki-loop (added by `memex wiki-loop init --install-cron`)\n*/30 * * * * memex wiki-loop run-maintainer >> /tmp/m.log 2>&1\n# END memex wiki-loop\n";
+
+    #[test]
+    fn splice_appends_to_unmarked_crontab_and_starts_fresh() {
+        let merged = splice_cron_block("0 5 * * * backup\n", BLOCK);
+        assert!(merged.starts_with("0 5 * * * backup\n\n# BEGIN memex wiki-loop"));
+        assert!(merged.ends_with("# END memex wiki-loop\n"));
+        // The other entries survive untouched.
+        assert!(merged.contains("0 5 * * * backup"));
+
+        let fresh = splice_cron_block("", BLOCK);
+        assert_eq!(fresh, BLOCK);
+
+        // Only-noise input (crontab -l failure fallback) is treated as empty.
+        assert_eq!(splice_cron_block("\n", BLOCK), BLOCK);
+    }
+
+    #[test]
+    fn splice_replaces_existing_block_in_place_and_exactly_once() {
+        let with_old = "0 5 * * * backup\n# BEGIN memex wiki-loop (old)\nold line\n# END memex wiki-loop\n9 9 * * * other\n";
+        let merged = splice_cron_block(with_old, BLOCK);
+        assert!(!merged.contains("old line"), "{}", merged);
+        assert!(!merged.contains("(old)"));
+        assert_eq!(merged.matches("# BEGIN memex wiki-loop").count(), 1);
+        // Position preserved: backup before the block, other after.
+        assert!(
+            merged.find("backup").unwrap() < merged.find("# BEGIN").unwrap()
+                && merged.find("# END").unwrap() < merged.find("other").unwrap(),
+            "{}",
+            merged
+        );
+    }
 }

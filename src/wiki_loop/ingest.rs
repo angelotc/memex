@@ -92,6 +92,38 @@ pub fn recent_sessions_for_project(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+/// Sessions whose last activity falls in `[since_ms, quiet_before_ms]` — i.e. ended (they
+/// have been quiet for at least the quiet window) and within the collector's lookback —
+/// oldest first, so the sweep drains history in the order it happened.
+pub fn ended_sessions_since(
+    analytics_db: &Path,
+    quiet_before_ms: i64,
+    since_ms: i64,
+    limit: usize,
+) -> Result<Vec<SessionMeta>> {
+    if !analytics_db.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        analytics_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    conn.pragma_update(None, "query_only", true)?;
+    let mut stmt = conn.prepare(
+        "SELECT source, session_id, source_path, project, cwd, git_root, repo_project,
+                started_at, last_at, message_count, resolution_status
+         FROM sessions
+         WHERE last_at <= ? AND last_at >= ? AND message_count >= 1
+         ORDER BY last_at ASC LIMIT ?",
+    )?;
+    let rows = stmt.query_map(
+        params![quiet_before_ms, since_ms, limit as i64],
+        map_session_row,
+    )?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
     Ok(SessionMeta {
         source: row.get(0)?,

@@ -18,7 +18,8 @@
 pub mod cli;
 
 pub use cli::WikiLoopCommand;
-mod config;
+mod collect;
+pub mod config;
 mod digest;
 mod gates;
 mod harness;

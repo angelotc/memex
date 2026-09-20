@@ -32,7 +32,11 @@ workspace defaults; with neither set, the loop uses `~/.memex/wiki` and `~/.agen
 
 The stages follow the paper's Algorithm 1:
 
-1. **Collect** — session hooks call `memex wiki-loop enqueue` (enqueue-only, no model calls).
+1. **Collect** — before each run, a sweep enqueues every session that has ended (been
+   quiet for the quiet window), is inside the lookback (`collect_lookback_days`), and is
+   not yet compiled through its current `last_at`. memex already centralizes transcripts,
+   so collection needs no per-harness hooks; `memex wiki-loop enqueue` remains for
+   session-end hooks that want sub-cron latency.
 2. **Sample** — the maintainer claims a context-fit batch: sessions that have **ended** and
    cleared the quiet window, stratified per Appendix C into up to **5 failing** traces
    (root-cause analysis) and up to **3 passing** traces (successful-strategy extraction,
@@ -89,9 +93,33 @@ validation gate. Production traces are untrusted and real tasks are not replayab
   they cannot. (The paper's wiki compounds per benchmark; this loop compounds across all
   projects under the workspace root, with scopes as the attribution layer.)
 
+## Install
+
+The loop is optional behavior layered on top of memex; it never touches the index or
+analytics store except read-only. One command scaffolds everything (no model calls):
+
+```bash
+memex wiki-loop init --workspace /apps --install-cron
+```
+
+That writes `~/.memex/wiki-loop.toml` when absent (everything in it is optional —
+defaults live in the binary), creates the wiki and skills directories, installs the
+marked crontab block (maintainer every 30 min, proposer every 6 h, running the exact
+binary `init` was invoked through), and finishes with a doctor check. Re-running is
+idempotent; `--install-cron` replaces its own marked block without touching the rest of
+the crontab. Then compile what already happened and watch it go:
+
+```bash
+memex wiki-loop run-maintainer   # sweep + compile ended sessions
+memex wiki-loop status           # queue depth, wiki growth, health
+```
+
+In the TUI, press `w` to browse the wiki and deployed skills read-only.
+
 ## Commands
 
 ```bash
+memex wiki-loop init [--workspace <dir>] [--install-cron] [--force]
 memex wiki-loop enqueue <source> <session_id> [--project <p>] [--ended]
 memex wiki-loop run-maintainer [--dry-run]
 memex wiki-loop run-proposer [--dry-run]
@@ -120,8 +148,9 @@ state_db             = "~/.local/state/wiki-loop/state.db"
 proposals_dir        = "~/.local/state/wiki-loop/proposals"
 
 # Sampling
-quiet_minutes  = 20   # a session must be quiet this long after ending
-min_turns      = 3    # skip trivial sessions
+quiet_minutes         = 20   # a session must be quiet this long after ending
+collect_lookback_days = 7    # sweep horizon for ended sessions (0 = all history)
+min_turns             = 3    # skip trivial sessions
 max_batch_size = 10   # sessions claimed per maintainer run, before stratification
 
 # Stratification (paper Appendix C: up to 8 traces = 5 failing + 3 passing)
@@ -154,11 +183,14 @@ by the harness, not silently treated as "nothing to record".
 
 ## Scheduling
 
-Hooks enqueue; cron runs the loop. Use absolute paths — cron has a minimal PATH.
+`init --install-cron` owns the schedule. To manage crontabs by hand instead (absolute
+paths — cron has a minimal PATH), the equivalent block is:
 
 ```cron
+# BEGIN memex wiki-loop
 */30 * * * * /usr/local/bin/memex wiki-loop run-maintainer >> ~/.local/state/wiki-loop/maintainer.log 2>&1
 17 */6 * * * /usr/local/bin/memex wiki-loop run-proposer   >> ~/.local/state/wiki-loop/proposer.log 2>&1
+# END memex wiki-loop
 ```
 
 Every mutating subcommand takes a `flock`-based role lock, so overlapping runs exit cleanly.

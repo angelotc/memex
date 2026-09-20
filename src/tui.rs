@@ -250,6 +250,7 @@ enum LayoutMode {
     Timeline,
     Detail,
     Wiki,
+    Skills,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -558,8 +559,79 @@ impl WikiEntryKind {
 struct WikiEntry {
     title: String,
     scope: Option<String>,
+    // Skills carry their SKILL.md frontmatter description for the list rows.
+    description: Option<String>,
     kind: WikiEntryKind,
     path: PathBuf,
+}
+
+// Shared pane state for the wiki and skills browser screens. Only these
+// fields (plus the file reads in update_content) back the browser keys.
+struct BrowserState {
+    entries: Vec<WikiEntry>,
+    list: ListState,
+    scroll: usize,
+    lines: Vec<PreviewLine>,
+    rendered_height: usize,
+    layout_width: u16,
+    line_offsets: Vec<usize>,
+    focus: Focus,
+}
+
+impl BrowserState {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            list: ListState::default(),
+            scroll: 0,
+            lines: Vec::new(),
+            rendered_height: 0,
+            layout_width: 0,
+            line_offsets: Vec::new(),
+            focus: Focus::List,
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            self.list.select(None);
+            return;
+        }
+        let idx = self.list.selected().unwrap_or(0) as isize + delta;
+        let next = idx.clamp(0, (self.entries.len() - 1) as isize) as usize;
+        self.list.select(Some(next));
+        self.update_content();
+    }
+
+    fn update_content(&mut self) {
+        self.scroll = 0;
+        self.rendered_height = 0;
+        self.layout_width = 0;
+        self.line_offsets.clear();
+        let Some(idx) = self.list.selected() else {
+            self.lines.clear();
+            return;
+        };
+        let Some(entry) = self.entries.get(idx) else {
+            self.lines.clear();
+            return;
+        };
+        self.lines = build_browser_lines(entry);
+    }
+
+    fn scroll(&mut self, delta: isize, view_height: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let line_count = self.rendered_height.max(self.lines.len());
+        let max_scroll = if view_height == 0 {
+            line_count.saturating_sub(1)
+        } else {
+            line_count.saturating_sub(view_height)
+        };
+        let next = (self.scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
+        self.scroll = next;
+    }
 }
 
 struct AppChannels {
@@ -664,15 +736,10 @@ struct App {
     last_detail_query: Option<String>,
     last_detail_mode: PreviewMode,
     last_detail_find: Option<String>,
-    wiki_entries: Vec<WikiEntry>,
-    wiki_list: ListState,
-    wiki_scroll: usize,
-    wiki_lines: Vec<PreviewLine>,
-    wiki_rendered_height: usize,
-    wiki_layout_width: u16,
-    wiki_line_offsets: Vec<usize>,
+    wiki: BrowserState,
+    skills: BrowserState,
     wiki_return_mode: LayoutMode,
-    wiki_focus: Focus,
+    skills_return_mode: LayoutMode,
     status: String,
     last_status_at: Option<Instant>,
     update_message: Option<String>,
@@ -1093,15 +1160,10 @@ impl App {
             last_detail_query: None,
             last_detail_mode: PreviewMode::Matches,
             last_detail_find: None,
-            wiki_entries: Vec::new(),
-            wiki_list: ListState::default(),
-            wiki_scroll: 0,
-            wiki_lines: Vec::new(),
-            wiki_rendered_height: 0,
-            wiki_layout_width: 0,
-            wiki_line_offsets: Vec::new(),
+            wiki: BrowserState::new(),
+            skills: BrowserState::new(),
             wiki_return_mode: LayoutMode::List,
-            wiki_focus: Focus::List,
+            skills_return_mode: LayoutMode::List,
             status: String::new(),
             last_status_at: None,
             update_message: None,
@@ -2340,6 +2402,8 @@ impl App {
             },
             // Wiki mode routes tab through handle_wiki_key.
             LayoutMode::Wiki => self.focus,
+            // Skills mode routes tab through handle_skills_key.
+            LayoutMode::Skills => self.focus,
         };
     }
 
@@ -2363,6 +2427,8 @@ impl App {
             },
             // Wiki mode routes tab through handle_wiki_key.
             LayoutMode::Wiki => self.focus,
+            // Skills mode routes tab through handle_skills_key.
+            LayoutMode::Skills => self.focus,
         };
     }
 
@@ -2414,6 +2480,7 @@ impl App {
             }
             LayoutMode::Timeline | LayoutMode::Detail => LayoutMode::Split,
             LayoutMode::Wiki => LayoutMode::Wiki,
+            LayoutMode::Skills => LayoutMode::Skills,
         };
     }
 
@@ -2638,31 +2705,26 @@ impl App {
         self.layout_mode = LayoutMode::Wiki;
         self.quick_popup = false;
         self.quick_lines.clear();
-        self.wiki_focus = Focus::List;
-        self.wiki_scroll = 0;
-        self.wiki_lines.clear();
-        match crate::wiki_loop::config::WikiLoopConfig::load(None) {
-            Ok(config) => {
-                self.wiki_entries = load_wiki_entries(&config);
-                if self.wiki_entries.is_empty() {
-                    self.wiki_list.select(None);
-                    self.wiki_lines = vec![PreviewLine::Text(format!(
-                        "no wiki found at {}; run `memex wiki-loop run-maintainer`",
-                        config.wiki_root.display()
-                    ))];
-                } else {
-                    self.wiki_list.select(Some(0));
-                    self.update_wiki_content();
-                }
-            }
-            Err(err) => {
-                self.wiki_entries.clear();
-                self.wiki_list.select(None);
-                self.wiki_lines = vec![PreviewLine::Text(format!(
-                    "couldn't load wiki config: {err}"
-                ))];
-            }
-        }
+        populate_browser(&mut self.wiki, load_wiki_entries, wiki_empty_note);
+    }
+
+    // Hops between the browser screens carry the sessions return mode
+    // across, so `w`/Esc still exits to where the browsing started instead
+    // of ping-ponging between the two browsers.
+    fn hop_to_skills(&mut self) {
+        self.skills_return_mode = self.wiki_return_mode;
+        self.layout_mode = LayoutMode::Skills;
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        populate_browser(&mut self.skills, load_skill_entries, skills_empty_note);
+    }
+
+    fn hop_to_wiki(&mut self) {
+        self.wiki_return_mode = self.skills_return_mode;
+        self.layout_mode = LayoutMode::Wiki;
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        populate_browser(&mut self.wiki, load_wiki_entries, wiki_empty_note);
     }
 
     fn exit_wiki(&mut self) {
@@ -2671,46 +2733,19 @@ impl App {
         self.quick_lines.clear();
     }
 
-    fn move_wiki_selection(&mut self, delta: isize) {
-        if self.wiki_entries.is_empty() {
-            self.wiki_list.select(None);
-            return;
-        }
-        let idx = self.wiki_list.selected().unwrap_or(0) as isize + delta;
-        let next = idx.clamp(0, (self.wiki_entries.len() - 1) as isize) as usize;
-        self.wiki_list.select(Some(next));
-        self.update_wiki_content();
+    fn exit_skills(&mut self) {
+        self.layout_mode = self.skills_return_mode;
+        self.quick_popup = false;
+        self.quick_lines.clear();
     }
 
-    fn update_wiki_content(&mut self) {
-        self.wiki_scroll = 0;
-        self.wiki_rendered_height = 0;
-        self.wiki_layout_width = 0;
-        self.wiki_line_offsets.clear();
-        let Some(idx) = self.wiki_list.selected() else {
-            self.wiki_lines.clear();
-            return;
-        };
-        let Some(entry) = self.wiki_entries.get(idx) else {
-            self.wiki_lines.clear();
-            return;
-        };
-        self.wiki_lines = build_wiki_lines(entry);
-    }
-
-    fn scroll_wiki(&mut self, delta: isize) {
-        if self.wiki_lines.is_empty() {
-            return;
+    // The browser whose panes are on screen; None outside wiki/skills mode.
+    fn active_browser(&mut self) -> Option<&mut BrowserState> {
+        match self.layout_mode {
+            LayoutMode::Wiki => Some(&mut self.wiki),
+            LayoutMode::Skills => Some(&mut self.skills),
+            _ => None,
         }
-        let view_height = self.preview_area.height as usize;
-        let line_count = self.wiki_rendered_height.max(self.wiki_lines.len());
-        let max_scroll = if view_height == 0 {
-            line_count.saturating_sub(1)
-        } else {
-            line_count.saturating_sub(view_height)
-        };
-        let next = (self.wiki_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
-        self.wiki_scroll = next;
     }
 
     fn update_find(&mut self) {
@@ -2990,6 +3025,10 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
 
     if app.layout_mode == LayoutMode::Wiki {
         return handle_wiki_key(key, app);
+    }
+
+    if app.layout_mode == LayoutMode::Skills {
+        return handle_skills_key(key, app);
     }
 
     if matches!(key.code, KeyCode::Esc) {
@@ -3407,47 +3446,78 @@ fn handle_wiki_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Esc | KeyCode::Char('w') => {
             app.exit_wiki();
         }
+        // `s` hops straight to the skills screen.
+        KeyCode::Char('s') => {
+            app.hop_to_skills();
+        }
+        _ => return handle_browser_key(key, app),
+    }
+    Ok(false)
+}
+
+fn handle_skills_key(key: KeyEvent, app: &mut App) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('s') => {
+            app.exit_skills();
+        }
+        // `w` hops straight to the wiki screen, not back to sessions.
+        KeyCode::Char('w') => {
+            app.hop_to_wiki();
+        }
+        _ => return handle_browser_key(key, app),
+    }
+    Ok(false)
+}
+
+// Wiki and skills share every browser key beyond the screen hops: pane
+// focus, list selection, and content scrolling.
+fn handle_browser_key(key: KeyEvent, app: &mut App) -> Result<bool> {
+    let view_height = app.preview_area.height as usize;
+    let Some(browser) = app.active_browser() else {
+        return Ok(false);
+    };
+    match key.code {
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
-            app.wiki_focus = match app.wiki_focus {
+            browser.focus = match browser.focus {
                 Focus::List => Focus::Preview,
                 _ => Focus::List,
             };
         }
         KeyCode::Up => {
-            if matches!(app.wiki_focus, Focus::Preview) {
-                app.scroll_wiki(-1);
+            if matches!(browser.focus, Focus::Preview) {
+                browser.scroll(-1, view_height);
             } else {
-                app.move_wiki_selection(-1);
+                browser.move_selection(-1);
             }
         }
         KeyCode::Down => {
-            if matches!(app.wiki_focus, Focus::Preview) {
-                app.scroll_wiki(1);
+            if matches!(browser.focus, Focus::Preview) {
+                browser.scroll(1, view_height);
             } else {
-                app.move_wiki_selection(1);
+                browser.move_selection(1);
             }
         }
         KeyCode::PageUp => {
-            if matches!(app.wiki_focus, Focus::Preview) {
-                app.scroll_wiki(-8);
+            if matches!(browser.focus, Focus::Preview) {
+                browser.scroll(-8, view_height);
             } else {
-                app.move_wiki_selection(-8);
+                browser.move_selection(-8);
             }
         }
         KeyCode::PageDown => {
-            if matches!(app.wiki_focus, Focus::Preview) {
-                app.scroll_wiki(8);
+            if matches!(browser.focus, Focus::Preview) {
+                browser.scroll(8, view_height);
             } else {
-                app.move_wiki_selection(8);
+                browser.move_selection(8);
             }
         }
-        KeyCode::Home if !app.wiki_entries.is_empty() => {
-            app.wiki_list.select(Some(0));
-            app.update_wiki_content();
+        KeyCode::Home if !browser.entries.is_empty() => {
+            browser.list.select(Some(0));
+            browser.update_content();
         }
-        KeyCode::End if !app.wiki_entries.is_empty() => {
-            app.wiki_list.select(Some(app.wiki_entries.len() - 1));
-            app.update_wiki_content();
+        KeyCode::End if !browser.entries.is_empty() => {
+            browser.list.select(Some(browser.entries.len() - 1));
+            browser.update_content();
         }
         _ => {}
     }
@@ -4565,10 +4635,10 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         return;
     }
 
-    if app.layout_mode == LayoutMode::Wiki {
+    if matches!(app.layout_mode, LayoutMode::Wiki | LayoutMode::Skills) {
         app.project_area = None;
         app.dragging = false;
-        draw_wiki(frame, app, theme, area);
+        draw_browser(frame, app, theme, area);
         return;
     }
 
@@ -5049,7 +5119,11 @@ fn draw_preview_panel(
     content
 }
 
-fn draw_wiki(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
+fn draw_browser(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let label = match app.layout_mode {
+        LayoutMode::Skills => "Skills",
+        _ => "Wiki",
+    };
     frame.render_widget(Block::default().style(theme.panel), area);
     // Narrow terminals stack the entry list above the content pane.
     if area.width < WIKI_STACK_MIN_WIDTH {
@@ -5061,8 +5135,8 @@ fn draw_wiki(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
                 Constraint::Min(5),
             ])
             .split(area);
-        let list_area = draw_wiki_list_panel(frame, app, theme, chunks[0]);
-        let preview_area = draw_wiki_content_panel(frame, app, theme, chunks[2]);
+        let list_area = draw_browser_list_panel(frame, app, theme, chunks[0], label);
+        let preview_area = draw_browser_content_panel(frame, app, theme, chunks[2], label);
         app.list_area = list_area;
         app.preview_area = preview_area;
         return;
@@ -5079,13 +5153,27 @@ fn draw_wiki(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     if SPLIT_GAP > 0 {
         draw_split_divider(frame, chunks[1]);
     }
-    let list_area = draw_wiki_list_panel(frame, app, theme, chunks[0]);
-    let preview_area = draw_wiki_content_panel(frame, app, theme, chunks[2]);
+    let list_area = draw_browser_list_panel(frame, app, theme, chunks[0], label);
+    let preview_area = draw_browser_content_panel(frame, app, theme, chunks[2], label);
     app.list_area = list_area;
     app.preview_area = preview_area;
 }
 
-fn wiki_entry_line(entry: &WikiEntry, theme: &Theme) -> Line<'static> {
+fn browser_entry_line(entry: &WikiEntry, theme: &Theme, width: u16) -> Line<'static> {
+    // Skill rows spend their width on a dim frontmatter description instead
+    // of the kind label every other entry leads with.
+    if matches!(entry.kind, WikiEntryKind::Skill) {
+        let mut spans = vec![Span::styled(entry.title.clone(), theme.text)];
+        if let Some(description) = entry.description.as_deref() {
+            let budget = (width as usize).saturating_sub(entry.title.chars().count() + 2);
+            let trimmed = truncate_end(description, budget);
+            if !trimmed.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(trimmed, theme.muted));
+            }
+        }
+        return Line::from(spans);
+    }
     let mut spans = vec![
         Span::styled(entry.kind.label(), theme.muted),
         Span::raw("  "),
@@ -5100,11 +5188,12 @@ fn wiki_entry_line(entry: &WikiEntry, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_wiki_list_panel(
+fn draw_browser_list_panel(
     frame: &mut ratatui::Frame,
     app: &mut App,
     theme: &Theme,
     area: Rect,
+    label: &str,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel), area);
     let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
@@ -5120,23 +5209,27 @@ fn draw_wiki_list_panel(
         width: inner.width,
         height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
     };
-    let title_style = if matches!(app.wiki_focus, Focus::List) {
+    let Some(browser) = app.active_browser() else {
+        return content;
+    };
+    let title_style = if matches!(browser.focus, Focus::List) {
         theme.focus
     } else {
         theme.text_bold
     };
-    let title = Paragraph::new(Line::from(Span::styled("Wiki", title_style)));
+    let title = Paragraph::new(Line::from(Span::styled(label, title_style)));
     frame.render_widget(title, header);
 
-    let list_items: Vec<ListItem> = if app.wiki_entries.is_empty() {
+    let list_items: Vec<ListItem> = if browser.entries.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            "no wiki entries",
+            format!("no {} entries", label.to_lowercase()),
             theme.muted,
         )))]
     } else {
-        app.wiki_entries
+        browser
+            .entries
             .iter()
-            .map(|entry| ListItem::new(wiki_entry_line(entry, theme)))
+            .map(|entry| ListItem::new(browser_entry_line(entry, theme, content.width)))
             .collect()
     };
 
@@ -5145,15 +5238,16 @@ fn draw_wiki_list_panel(
         .highlight_style(theme.selection)
         .highlight_symbol("");
 
-    frame.render_stateful_widget(list, content, &mut app.wiki_list);
+    frame.render_stateful_widget(list, content, &mut browser.list);
     content
 }
 
-fn draw_wiki_content_panel(
+fn draw_browser_content_panel(
     frame: &mut ratatui::Frame,
     app: &mut App,
     theme: &Theme,
     area: Rect,
+    label: &str,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel_alt), area);
     let inner = panel_inner_after_split(area);
@@ -5169,34 +5263,37 @@ fn draw_wiki_content_panel(
         width: inner.width,
         height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
     };
-    let title = app
-        .wiki_list
+    let Some(browser) = app.active_browser() else {
+        return content;
+    };
+    let title = browser
+        .list
         .selected()
-        .and_then(|idx| app.wiki_entries.get(idx))
+        .and_then(|idx| browser.entries.get(idx))
         .map(|entry| entry.title.clone())
-        .unwrap_or_else(|| "Wiki".to_string());
-    let title_style = if matches!(app.wiki_focus, Focus::Preview) {
+        .unwrap_or_else(|| label.to_string());
+    let title_style = if matches!(browser.focus, Focus::Preview) {
         theme.focus
     } else {
         theme.text_bold
     };
     let title = Paragraph::new(Line::from(Span::styled(title, title_style)));
     frame.render_widget(title, header);
-    if app.wiki_layout_width != content.width {
-        app.wiki_line_offsets = preview_line_offsets(&app.wiki_lines, theme, content.width);
-        app.wiki_rendered_height = app.wiki_line_offsets.last().copied().unwrap_or(0);
-        app.wiki_layout_width = content.width;
+    if browser.layout_width != content.width {
+        browser.line_offsets = preview_line_offsets(&browser.lines, theme, content.width);
+        browser.rendered_height = browser.line_offsets.last().copied().unwrap_or(0);
+        browser.layout_width = content.width;
     }
-    let max_scroll = app
-        .wiki_rendered_height
+    let max_scroll = browser
+        .rendered_height
         .saturating_sub(content.height as usize);
-    app.wiki_scroll = app.wiki_scroll.min(max_scroll);
+    browser.scroll = browser.scroll.min(max_scroll);
     let (visible_range, local_scroll) = preview_line_window(
-        &app.wiki_line_offsets,
-        app.wiki_scroll,
+        &browser.line_offsets,
+        browser.scroll,
         content.height as usize,
     );
-    let rendered_lines: Vec<Line> = app.wiki_lines[visible_range]
+    let rendered_lines: Vec<Line> = browser.lines[visible_range]
         .iter()
         .map(|line| render_preview_line(line, theme))
         .collect();
@@ -5274,6 +5371,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         LayoutMode::Timeline => "timeline",
         LayoutMode::Detail => "detail",
         LayoutMode::Wiki => "wiki",
+        LayoutMode::Skills => "skills",
     };
     let mut right_spans = Vec::new();
     if !app.status.is_empty() {
@@ -5330,14 +5428,17 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     // Keep an active source filter visible while browsing, when the query bar
     // (the other source readout) is hidden. Omit it when unfiltered.
     if app.source != SourceChoice::All
-        && !matches!(app.layout_mode, LayoutMode::Timeline | LayoutMode::Wiki)
+        && !matches!(
+            app.layout_mode,
+            LayoutMode::Timeline | LayoutMode::Wiki | LayoutMode::Skills
+        )
     {
         right_spans.push(Span::styled("source ", theme.muted));
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
     if (app.session_kind != crate::analytics::SessionKindFilter::All
-        && app.layout_mode != LayoutMode::Wiki)
+        && !matches!(app.layout_mode, LayoutMode::Wiki | LayoutMode::Skills))
         || matches!(
             app.layout_mode,
             LayoutMode::Home | LayoutMode::List | LayoutMode::Split
@@ -5397,7 +5498,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     }
     if !matches!(
         app.layout_mode,
-        LayoutMode::Timeline | LayoutMode::Home | LayoutMode::Wiki
+        LayoutMode::Timeline | LayoutMode::Home | LayoutMode::Wiki | LayoutMode::Skills
     ) {
         right_spans.push(Span::raw("   "));
         right_spans.push(Span::styled("mode ", theme.muted));
@@ -5487,11 +5588,22 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
 
     if app.layout_mode == LayoutMode::Wiki {
         return Line::from(vec![
-            Span::styled("↑↓", theme.accent),
-            Span::styled(" move  ", theme.muted),
+            Span::styled("s", theme.accent),
+            Span::styled(" skills  ", theme.muted),
             Span::styled("←→/tab", theme.accent),
             Span::styled(" pane  ", theme.muted),
             Span::styled("w/esc", theme.accent),
+            Span::styled(" back", theme.muted),
+        ]);
+    }
+
+    if app.layout_mode == LayoutMode::Skills {
+        return Line::from(vec![
+            Span::styled("w", theme.accent),
+            Span::styled(" wiki  ", theme.muted),
+            Span::styled("←→/tab", theme.accent),
+            Span::styled(" pane  ", theme.muted),
+            Span::styled("s/esc", theme.accent),
             Span::styled(" back", theme.muted),
         ]);
     }
@@ -6775,14 +6887,15 @@ fn load_wiki_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<W
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let title = wiki_frontmatter_field(&content, "title")
+            let title = frontmatter_field(&content, "title")
                 .map(|title| title.chars().take(80).collect::<String>())
                 .filter(|title| !title.is_empty())
                 .unwrap_or(stem);
-            let scope = wiki_frontmatter_field(&content, "scope").filter(|scope| !scope.is_empty());
+            let scope = frontmatter_field(&content, "scope").filter(|scope| !scope.is_empty());
             entries.push(WikiEntry {
                 title,
                 scope,
+                description: None,
                 kind: WikiEntryKind::Pattern,
                 path,
             });
@@ -6799,29 +6912,9 @@ fn load_wiki_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<W
             entries.push(WikiEntry {
                 title: title.to_string(),
                 scope: None,
+                description: None,
                 kind,
                 path,
-            });
-        }
-    }
-
-    if let Ok(dir) = std::fs::read_dir(&config.skills_root) {
-        let mut dirs: Vec<PathBuf> = dir
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
-            .collect();
-        dirs.sort();
-        for path in dirs {
-            let title = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            entries.push(WikiEntry {
-                title,
-                scope: None,
-                kind: WikiEntryKind::Skill,
-                path: path.join("SKILL.md"),
             });
         }
     }
@@ -6829,7 +6922,82 @@ fn load_wiki_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<W
     entries
 }
 
-fn wiki_frontmatter_field(content: &str, key: &str) -> Option<String> {
+fn load_skill_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<WikiEntry> {
+    let mut entries = Vec::new();
+    let Ok(dir) = std::fs::read_dir(&config.skills_root) else {
+        return entries;
+    };
+    let mut dirs: Vec<PathBuf> = dir
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
+        .collect();
+    dirs.sort();
+    for path in dirs {
+        let title = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let content = std::fs::read_to_string(path.join("SKILL.md")).unwrap_or_default();
+        let description = frontmatter_field(&content, "description")
+            .filter(|description| !description.is_empty());
+        entries.push(WikiEntry {
+            title,
+            scope: None,
+            description,
+            kind: WikiEntryKind::Skill,
+            path: path.join("SKILL.md"),
+        });
+    }
+    entries
+}
+
+// Both browser screens reload their entries from the wiki-loop config on
+// entry (nothing is cached) and share the same empty/error note handling.
+fn populate_browser(
+    browser: &mut BrowserState,
+    load: fn(&crate::wiki_loop::config::WikiLoopConfig) -> Vec<WikiEntry>,
+    empty_note: fn(&crate::wiki_loop::config::WikiLoopConfig) -> String,
+) {
+    browser.focus = Focus::List;
+    browser.scroll = 0;
+    browser.lines.clear();
+    match crate::wiki_loop::config::WikiLoopConfig::load(None) {
+        Ok(config) => {
+            browser.entries = load(&config);
+            if browser.entries.is_empty() {
+                browser.list.select(None);
+                browser.lines = vec![PreviewLine::Text(empty_note(&config))];
+            } else {
+                browser.list.select(Some(0));
+                browser.update_content();
+            }
+        }
+        Err(err) => {
+            browser.entries.clear();
+            browser.list.select(None);
+            browser.lines = vec![PreviewLine::Text(format!(
+                "couldn't load wiki config: {err}"
+            ))];
+        }
+    }
+}
+
+fn wiki_empty_note(config: &crate::wiki_loop::config::WikiLoopConfig) -> String {
+    format!(
+        "no wiki found at {}; run `memex wiki-loop run-maintainer`",
+        config.wiki_root.display()
+    )
+}
+
+fn skills_empty_note(config: &crate::wiki_loop::config::WikiLoopConfig) -> String {
+    format!(
+        "no skills found at {}; skills appear here after `memex wiki-loop apply`",
+        config.skills_root.display()
+    )
+}
+
+fn frontmatter_field(content: &str, key: &str) -> Option<String> {
     let mut lines = content.lines();
     if lines.next()?.trim() != "---" {
         return None;
@@ -6855,7 +7023,7 @@ fn wiki_frontmatter_field(content: &str, key: &str) -> Option<String> {
     None
 }
 
-fn build_wiki_lines(entry: &WikiEntry) -> Vec<PreviewLine> {
+fn build_browser_lines(entry: &WikiEntry) -> Vec<PreviewLine> {
     let content = match std::fs::read_to_string(&entry.path) {
         Ok(content) => content,
         Err(err) => {
@@ -6866,16 +7034,28 @@ fn build_wiki_lines(entry: &WikiEntry) -> Vec<PreviewLine> {
         }
     };
     let mut lines = Vec::new();
+    append_capped_markdown(&mut lines, &content);
+    // Skills append their PURPOSE.md below a separator when the file exists.
+    if matches!(entry.kind, WikiEntryKind::Skill)
+        && let Some(dir) = entry.path.parent()
+        && let Ok(purpose) = std::fs::read_to_string(dir.join("PURPOSE.md"))
+    {
+        lines.push(PreviewLine::Empty);
+        append_capped_markdown(&mut lines, &purpose);
+    }
+    lines
+}
+
+fn append_capped_markdown(lines: &mut Vec<PreviewLine>, content: &str) {
     if content.chars().count() > WIKI_MAX_CHARS {
         let truncated: String = content.chars().take(WIKI_MAX_CHARS).collect();
-        append_markdown(&mut lines, &truncated);
+        append_markdown(lines, &truncated);
         lines.push(PreviewLine::Text(format!(
             "… content truncated at {WIKI_MAX_CHARS} chars"
         )));
     } else {
-        append_markdown(&mut lines, &content);
+        append_markdown(lines, content);
     }
-    lines
 }
 
 fn record_preview_text(record: &Record) -> Cow<'_, str> {
@@ -7267,8 +7447,8 @@ fn handle_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) ->
         return handle_home_mouse(mouse, terminal, app);
     }
 
-    if app.layout_mode == LayoutMode::Wiki {
-        return handle_wiki_mouse(mouse, app);
+    if matches!(app.layout_mode, LayoutMode::Wiki | LayoutMode::Skills) {
+        return handle_browser_mouse(mouse, app);
     }
 
     match mouse.kind {
@@ -7431,19 +7611,23 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
     }
 }
 
-fn handle_wiki_mouse(mouse: MouseEvent, app: &mut App) -> Result<bool> {
+fn handle_browser_mouse(mouse: MouseEvent, app: &mut App) -> Result<bool> {
     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+    let list_area = app.list_area;
+    let preview_area = app.preview_area;
+    let Some(browser) = app.active_browser() else {
+        return Ok(false);
+    };
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.list_area.contains(pos) {
-                app.wiki_focus = Focus::List;
-                if let Some(idx) = list_index_from_mouse(pos, app.list_area, app.wiki_entries.len())
-                {
-                    app.wiki_list.select(Some(idx));
-                    app.update_wiki_content();
+            if list_area.contains(pos) {
+                browser.focus = Focus::List;
+                if let Some(idx) = list_index_from_mouse(pos, list_area, browser.entries.len()) {
+                    browser.list.select(Some(idx));
+                    browser.update_content();
                 }
-            } else if app.preview_area.contains(pos) {
-                app.wiki_focus = Focus::Preview;
+            } else if preview_area.contains(pos) {
+                browser.focus = Focus::Preview;
             } else {
                 return Ok(false);
             }
@@ -7455,12 +7639,12 @@ fn handle_wiki_mouse(mouse: MouseEvent, app: &mut App) -> Result<bool> {
             } else {
                 -WHEEL_SCROLL_LINES
             };
-            if app.preview_area.contains(pos) {
-                app.wiki_focus = Focus::Preview;
-                app.scroll_wiki(delta);
-            } else if app.list_area.contains(pos) {
-                app.wiki_focus = Focus::List;
-                app.move_wiki_selection(delta);
+            if preview_area.contains(pos) {
+                browser.focus = Focus::Preview;
+                browser.scroll(delta, preview_area.height as usize);
+            } else if list_area.contains(pos) {
+                browser.focus = Focus::List;
+                browser.move_selection(delta);
             } else {
                 return Ok(false);
             }
@@ -8182,13 +8366,12 @@ mod tests {
     }
 
     #[test]
-    fn wiki_loader_reads_patterns_pages_and_skills() {
+    fn wiki_loader_reads_patterns_and_pages_without_skills() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let wiki_root = tmp.path().join("wiki");
         let skills_root = tmp.path().join("skills");
         std::fs::create_dir_all(wiki_root.join("patterns")).expect("patterns dir");
         std::fs::create_dir_all(skills_root.join("sql-optimizer")).expect("skill dir");
-        std::fs::create_dir_all(skills_root.join("no-skill-md")).expect("incomplete skill dir");
         std::fs::write(
             wiki_root.join("patterns/b-sql-store.md"),
             "---\nid: pat_2\ntitle: \"SQLite store failure\"\nscope: project:memex\n---\n\n## Symptom\nboom\n",
@@ -8213,13 +8396,13 @@ mod tests {
 
         let config = crate::wiki_loop::config::WikiLoopConfig {
             wiki_root,
-            skills_root: skills_root.clone(),
+            skills_root,
             ..Default::default()
         };
         let entries = load_wiki_entries(&config);
 
-        // Patterns sort by filename, then the index page, then skills; absent
-        // pages (logs, skill-impact) and skill dirs without SKILL.md drop out.
+        // Patterns sort by filename, then the index page; absent pages (logs,
+        // skill-impact) drop out and skills live on their own screen.
         let titles: Vec<&str> = entries.iter().map(|entry| entry.title.as_str()).collect();
         assert_eq!(
             titles,
@@ -8227,8 +8410,7 @@ mod tests {
                 "Corepack breaks",
                 "SQLite store failure",
                 "c-untitled",
-                "Wiki Index",
-                "sql-optimizer",
+                "Wiki Index"
             ]
         );
         assert_eq!(entries[0].scope.as_deref(), Some("global"));
@@ -8236,15 +8418,55 @@ mod tests {
         assert_eq!(entries[2].scope, None);
         assert!(matches!(entries[0].kind, WikiEntryKind::Pattern));
         assert!(matches!(entries[3].kind, WikiEntryKind::Index));
-        assert!(matches!(entries[4].kind, WikiEntryKind::Skill));
-        assert_eq!(
-            entries[4].path,
-            skills_root.join("sql-optimizer").join("SKILL.md")
-        );
         assert!(
             !entries
                 .iter()
                 .any(|entry| matches!(entry.kind, WikiEntryKind::Logs | WikiEntryKind::Impact))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry.kind, WikiEntryKind::Skill))
+        );
+    }
+
+    #[test]
+    fn skill_loader_reads_dirs_and_frontmatter_descriptions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_root = tmp.path().join("skills");
+        std::fs::create_dir_all(skills_root.join("sql-optimizer")).expect("skill dir");
+        std::fs::create_dir_all(skills_root.join("no-skill-md")).expect("incomplete skill dir");
+        std::fs::write(
+            skills_root.join("sql-optimizer/SKILL.md"),
+            "---\nname: sql-optimizer\ndescription: \"Tunes slow queries\"\n---\n\n## When\nslow\n",
+        )
+        .expect("skill");
+        std::fs::write(
+            skills_root.join("sql-optimizer/PURPOSE.md"),
+            "# Purpose\nkeep queries fast\n",
+        )
+        .expect("purpose");
+
+        let config = crate::wiki_loop::config::WikiLoopConfig {
+            wiki_root: tmp.path().join("wiki"),
+            skills_root: skills_root.clone(),
+            ..Default::default()
+        };
+        let entries = load_skill_entries(&config);
+
+        // Skill dirs without SKILL.md drop out; titles are dir names and
+        // descriptions come from the SKILL.md frontmatter.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "sql-optimizer");
+        assert_eq!(
+            entries[0].description.as_deref(),
+            Some("Tunes slow queries")
+        );
+        assert_eq!(entries[0].scope, None);
+        assert!(matches!(entries[0].kind, WikiEntryKind::Skill));
+        assert_eq!(
+            entries[0].path,
+            skills_root.join("sql-optimizer").join("SKILL.md")
         );
     }
 
@@ -8256,11 +8478,12 @@ mod tests {
         let entry = WikiEntry {
             title: "huge".to_string(),
             scope: None,
+            description: None,
             kind: WikiEntryKind::Pattern,
             path,
         };
 
-        let lines = build_wiki_lines(&entry);
+        let lines = build_browser_lines(&entry);
 
         let content_chars = lines
             .iter()
@@ -8291,11 +8514,44 @@ mod tests {
         app.enter_wiki();
         assert_eq!(app.layout_mode, LayoutMode::Wiki);
         assert_eq!(app.wiki_return_mode, LayoutMode::Split);
-        assert!(matches!(app.wiki_focus, Focus::List));
-        assert!(app.wiki_list.selected().is_some() || app.wiki_entries.is_empty());
+        assert!(matches!(app.wiki.focus, Focus::List));
+        assert!(app.wiki.list.selected().is_some() || app.wiki.entries.is_empty());
 
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
         handle_wiki_key(key, &mut app).expect("key");
+        assert_eq!(app.layout_mode, LayoutMode::Split);
+    }
+
+    #[test]
+    fn browser_hops_between_wiki_and_skills() {
+        let (_tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Split;
+
+        app.enter_wiki();
+        assert_eq!(app.layout_mode, LayoutMode::Wiki);
+        assert_eq!(app.wiki_return_mode, LayoutMode::Split);
+
+        // `s` hops to skills, carrying the sessions return mode across.
+        let hop = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty());
+        handle_wiki_key(hop, &mut app).expect("hop");
+        assert_eq!(app.layout_mode, LayoutMode::Skills);
+        assert_eq!(app.skills_return_mode, LayoutMode::Split);
+
+        // `w` hops back to wiki without disturbing the return mode.
+        let hop = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::empty());
+        handle_skills_key(hop, &mut app).expect("hop back");
+        assert_eq!(app.layout_mode, LayoutMode::Wiki);
+        assert_eq!(app.wiki_return_mode, LayoutMode::Split);
+
+        // Esc from either browser screen exits to sessions.
+        let exit = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+        handle_wiki_key(exit, &mut app).expect("exit from wiki");
+        assert_eq!(app.layout_mode, LayoutMode::Split);
+
+        let to_skills = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty());
+        app.enter_wiki();
+        handle_wiki_key(to_skills, &mut app).expect("hop to skills");
+        handle_skills_key(exit, &mut app).expect("exit from skills");
         assert_eq!(app.layout_mode, LayoutMode::Split);
     }
 
@@ -8310,25 +8566,26 @@ mod tests {
         .expect("pattern");
         let (_tmp, mut app) = test_app();
         app.layout_mode = LayoutMode::Wiki;
-        app.wiki_focus = Focus::List;
-        app.wiki_entries = vec![WikiEntry {
+        app.wiki.focus = Focus::List;
+        app.wiki.entries = vec![WikiEntry {
             title: "SQLite failure".to_string(),
             scope: Some("project:memex".to_string()),
+            description: None,
             kind: WikiEntryKind::Pattern,
             path,
         }];
-        app.wiki_list.select(Some(0));
-        app.update_wiki_content();
+        app.wiki.list.select(Some(0));
+        app.wiki.update_content();
         let theme = Theme::new();
 
         // Wide terminal: entries left, content right.
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         terminal
-            .draw(|frame| draw_wiki(frame, &mut app, &theme, frame.area()))
+            .draw(|frame| draw_browser(frame, &mut app, &theme, frame.area()))
             .expect("draw wiki");
         assert!(app.list_area.width > 0);
         assert!(app.preview_area.x > app.list_area.x);
-        assert!(app.wiki_rendered_height > 0);
+        assert!(app.wiki.rendered_height > 0);
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -8343,9 +8600,58 @@ mod tests {
         // Narrow terminal: the entry list stacks above the content pane.
         let mut narrow = Terminal::new(TestBackend::new(50, 24)).expect("terminal");
         narrow
-            .draw(|frame| draw_wiki(frame, &mut app, &theme, frame.area()))
+            .draw(|frame| draw_browser(frame, &mut app, &theme, frame.area()))
             .expect("draw wiki stacked");
         assert!(app.preview_area.y >= app.list_area.y + app.list_area.height);
+    }
+
+    #[test]
+    fn skills_panels_render_description_and_purpose() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("skills").join("sql-tuner");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: sql-tuner\ndescription: tunes slow queries\n---\n\n## When to use\nqueries crawl\n",
+        )
+        .expect("skill");
+        std::fs::write(skill_dir.join("PURPOSE.md"), "# Purpose\nkeep p99 low\n").expect("purpose");
+        let (_tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Skills;
+        app.skills.focus = Focus::List;
+        app.skills.entries = vec![WikiEntry {
+            title: "sql-tuner".to_string(),
+            scope: None,
+            description: Some("tunes slow queries".to_string()),
+            kind: WikiEntryKind::Skill,
+            path: skill_dir.join("SKILL.md"),
+        }];
+        app.skills.list.select(Some(0));
+        app.skills.update_content();
+        let theme = Theme::new();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| draw_browser(frame, &mut app, &theme, frame.area()))
+            .expect("draw skills");
+        assert!(app.list_area.width > 0);
+        assert!(app.preview_area.x > app.list_area.x);
+        assert!(app.skills.rendered_height > 0);
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        // List row pairs the name with the dim description; the content pane
+        // carries the SKILL.md body and the appended PURPOSE.md section.
+        assert!(rendered.contains("sql-tuner"));
+        assert!(rendered.contains("tunes slow queries"));
+        assert!(rendered.contains("When to use"));
+        assert!(rendered.contains("queries crawl"));
+        assert!(rendered.contains("Purpose"));
+        assert!(rendered.contains("keep p99 low"));
     }
 
     #[test]

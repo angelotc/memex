@@ -624,6 +624,26 @@ fn cwd_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Option<PathBuf> {
     workspace
 }
 
+/// Cwd for a brain projection that carries none of its own: discovery prefers
+/// transcripts over the SQLite store, but the sibling
+/// `conversations/<session_id>.db` still records the project root on its user
+/// steps, so it remains available as a fallback.
+fn sibling_db_cwd(path: &Path) -> Option<PathBuf> {
+    let session_id = session_id_from_brain_path(path);
+    for profile in PROFILES {
+        let db = sessions_root()
+            .join(profile)
+            .join("conversations")
+            .join(format!("{session_id}.db"));
+        if db.is_file()
+            && let Some(cwd) = session_cwd(&db)
+        {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
 fn index_transcript_file(
     path: &Path,
     include_reasoning: bool,
@@ -641,7 +661,7 @@ fn index_transcript_file(
     // Resolve the working directory before emitting anything so every record
     // carries the same project: tool invocations hold it in their args, and a
     // cwd found mid-file would otherwise split the session across two projects.
-    let session_cwd = cwd_from_lines(text.lines());
+    let session_cwd = cwd_from_lines(text.lines()).or_else(|| sibling_db_cwd(path));
     let project = session_cwd
         .as_ref()
         .and_then(|cwd| cwd.file_name())
@@ -888,7 +908,7 @@ pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
     if (is_transcript_path(path) || is_overview_path(path))
         && let Ok(text) = std::fs::read_to_string(path)
     {
-        return cwd_from_lines(text.lines());
+        return cwd_from_lines(text.lines()).or_else(|| sibling_db_cwd(path));
     }
     None
 }
@@ -1680,6 +1700,62 @@ mod tests {
             Some(PathBuf::from("/fallback repo"))
         );
         assert_eq!(cwd_from_lines([r#"{"tool_calls":[{"args":{"SearchPath":"/repo/src/main.rs","DirectoryPath":"/repo/src"}}]}"#].into_iter()), None);
+    }
+
+    #[test]
+    fn transcript_without_inline_cwd_falls_back_to_sibling_db() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("ANTIGRAVITY_HOME", Some(temp.path().to_str().unwrap()))]);
+        // A brain transcript with neither a Cwd tool argument nor a workspace
+        // mapping: on its own it would resolve no cwd at all.
+        let logs = temp
+            .path()
+            .join("antigravity-cli/brain/abc-123/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript_full.jsonl");
+        fs::write(
+            &transcript,
+            r#"{"type":"USER_INPUT","content":"hello"}
+{"type":"PLANNER_RESPONSE","content":"hi"}"#,
+        )
+        .unwrap();
+        // The sibling conversation store carries the project root.
+        let conversations = temp.path().join("antigravity-cli/conversations");
+        fs::create_dir_all(&conversations).unwrap();
+        let db = conversations.join("abc-123.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (
+                idx INTEGER PRIMARY KEY,
+                step_type INTEGER,
+                status INTEGER,
+                has_subtrajectory NUMERIC,
+                step_payload BLOB
+            );",
+        )
+        .unwrap();
+        let payload = field_bytes(
+            19,
+            &field_bytes(
+                4,
+                &field_bytes(2, &field_bytes(13, b"file:///work/my-repo")),
+            ),
+        );
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload) \
+             VALUES (0, 14, 3, false, ?1)",
+            rusqlite::params![payload],
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_cwd(&transcript).as_deref(),
+            Some(Path::new("/work/my-repo"))
+        );
+        let (records, output) = emit_collect(&transcript, false);
+        assert_eq!(output.session_cwd.as_deref(), Some("/work/my-repo"));
+        assert!(records.iter().all(|record| record.project == "my-repo"));
     }
 
     #[test]

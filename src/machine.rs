@@ -3108,41 +3108,11 @@ fn records_for_session_page(
 }
 
 fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback = None;
-    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                value
-                    .get("payload")
-                    .and_then(|payload| payload.get("cwd"))
-                    .and_then(|value| value.as_str())
-            })
-            .map(str::to_string);
-        if fallback.is_none() {
-            fallback.clone_from(&cwd);
-        }
-        let matches_session = value
-            .get("sessionId")
-            .and_then(|value| value.as_str())
-            .or_else(|| value.get("session_id").and_then(|value| value.as_str()))
-            .is_some_and(|id| id == session_id);
-        if matches_session && cwd.is_some() {
-            return cwd;
-        }
-        if value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
-            && cwd.is_some()
-        {
-            return cwd;
-        }
-    }
-    fallback
+    crate::sources::session_cwd(
+        crate::sources::classify_path(&path.to_string_lossy()),
+        path,
+        session_id,
+    )
 }
 
 fn rpc_records(

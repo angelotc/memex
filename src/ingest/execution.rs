@@ -72,6 +72,40 @@ pub(super) fn parse_antigravity_file(
     )
 }
 
+pub(super) fn parse_zcode_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::zcode::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Zcode, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Zcode,
+        source_path,
+        parsed,
+    )
+}
+
 pub(super) fn parse_bob_task(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -844,6 +878,14 @@ impl ParserContext<'_> {
                     self.next_id,
                     self.progress,
                 ),
+                SourceKind::Zcode => parse_zcode_file(
+                    task,
+                    self.options.include_reasoning,
+                    self.records,
+                    self.updates,
+                    self.next_id,
+                    self.progress,
+                ),
             };
             finish_file_task(task, self.progress, skipped, result)
         };
@@ -1118,6 +1160,11 @@ pub(super) fn refresh_memories(
         );
     }
     if options.embeddings {
+        let _embedding_lease = IngestLease::acquire_embedding(
+            paths,
+            "ingest-memory-vectors",
+            crate::lease::INGEST_LEASE_TIMEOUT,
+        )?;
         let count =
             crate::memory_search::embed_memory(paths, options.model, &options.embed_runtime)?;
         if count > 0 {
@@ -1242,7 +1289,16 @@ pub(super) fn execute_refresh(
             || !opencode_scope_targets.is_empty()
             || !opencode_database_paths_to_delete.is_empty()
             || !vector_delete_paths.is_empty())
-            && crate::vector::VectorIndex::exists(&paths.vectors));
+            && (crate::vector::VectorIndex::exists(&paths.vectors)
+                || crate::lease::is_embedding_held(paths)));
+    let _embedding_lease = if vector_publication {
+        match IngestLease::try_acquire_embedding(paths, "ingest-vectors")? {
+            crate::lease::LeaseAttempt::Acquired(lease) => Some(lease),
+            crate::lease::LeaseAttempt::Busy(_) => return Err(crate::lease::EmbeddingBusy.into()),
+        }
+    } else {
+        None
+    };
     let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();

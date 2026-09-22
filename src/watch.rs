@@ -166,6 +166,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_bob {
         roots.extend(crate::sources::bob::roots());
     }
+    if options.include_zcode {
+        roots.extend(crate::sources::zcode::db_dirs());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -213,6 +216,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                 let database = path.with_file_name(name);
                 crate::sources::opencode::is_database_path(name)
                     || crate::sources::bob::is_configured_database(&database)
+                    || crate::sources::zcode::db_paths().contains(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -370,6 +374,14 @@ fn enqueue_event(
     overflow: &AtomicBool,
     event: notify::Result<Event>,
 ) {
+    // Ingestion itself emits Linux access events. Discard them before they can
+    // overflow the queue and trigger another scan of the same files.
+    if event
+        .as_ref()
+        .is_ok_and(|event| matches!(event.kind, EventKind::Access(_)) && !event.need_rescan())
+    {
+        return;
+    }
     // Never block the OS watcher during ingestion. One sticky bit preserves
     // the need to reconcile when bounded buffering cannot retain all hints.
     if let Err(TrySendError::Full(_)) = sender.try_send(event) {
@@ -399,10 +411,12 @@ pub(crate) fn sweep_candidates(
     snapshot.retain(|key, file| {
         file.identity.sqlite_wal.is_none()
             && file.identity.bob_database.is_none()
+            && file.identity.zcode_database.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
     databases.extend(reader.bob_database_paths()?);
+    databases.extend(reader.zcode_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -714,10 +728,13 @@ impl WatchService {
             let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
             sweep_candidates(&reader, cutoff)?
         };
-        // A Bob database with no indexed task yet has no state key to derive from; seed it
+        // A Bob/ZCode database with no indexed session yet has no state key; seed it
         // from the configuration whenever this daemon watches its directory, so the first
         // commits through a held-open WAL are noticed too.
-        for database in crate::sources::bob::database_paths() {
+        for database in crate::sources::bob::database_paths()
+            .into_iter()
+            .chain(crate::sources::zcode::db_paths())
+        {
             if database.is_file()
                 && crate::sources::bob::canonical_alias(&database)
                     .is_some_and(|alias| self.watched.iter().any(|root| alias.starts_with(root)))
@@ -795,6 +812,7 @@ mod tests {
             include_muse: true,
             include_antigravity: true,
             include_bob: true,
+            include_zcode: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -908,6 +926,7 @@ mod tests {
         options.include_muse = false;
         options.include_antigravity = false;
         options.include_bob = false;
+        options.include_zcode = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -996,6 +1015,36 @@ mod tests {
                 assert!(interesting_event_paths(&event, &excluder).0.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn access_events_do_not_fill_the_queue() {
+        let (sender, receiver) = bounded(1);
+        let overflow = AtomicBool::new(false);
+        for _ in 0..EVENT_QUEUE_CAPACITY + 1 {
+            enqueue_event(
+                &sender,
+                &overflow,
+                Ok(Event::new(EventKind::Access(
+                    notify::event::AccessKind::Any,
+                ))),
+            );
+        }
+        assert!(receiver.is_empty());
+        assert!(!overflow.load(Ordering::Acquire));
+        enqueue_event(&sender, &overflow, Ok(Event::new(EventKind::Any)));
+        assert_eq!(receiver.len(), 1);
+        receiver.try_recv().unwrap().unwrap();
+        enqueue_event(
+            &sender,
+            &overflow,
+            Ok(
+                Event::new(EventKind::Access(notify::event::AccessKind::Any))
+                    .set_flag(notify::event::Flag::Rescan),
+            ),
+        );
+        assert!(receiver.try_recv().unwrap().unwrap().need_rescan());
+        assert!(!overflow.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1341,6 +1390,7 @@ mod tests {
             codex_metadata_offsets: None,
             identity: FileIdentity {
                 bob_database: None,
+                zcode_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,

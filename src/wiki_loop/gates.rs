@@ -172,9 +172,16 @@ pub fn tier0(
 
     // 5. Recently-rejected proposals are not re-proposed (paper: the impact tracker prevents
     //    re-proposing rejected interventions; enforced here programmatically as a backstop).
+    //    A skill with a live deployment is exempt: a recent rejection then was the human
+    //    denying a redundant duplicate (or an older patch), not the skill itself, and the
+    //    mute would freeze a deployed skill's evolution — dedup already blocks identical
+    //    content, so anything reaching here is a patch proposal (the v2+ path).
     let week_ago = now_ms() - 7 * 24 * 3_600_000;
     let rejected = ledger.rejected_proposals_since(week_ago)?;
-    let re_rejected = rejected.contains(&proposal.skill_name);
+    let re_rejected = rejected.contains(&proposal.skill_name)
+        && ledger
+            .latest_deployment_version(&proposal.skill_name)?
+            .is_none();
     results.push((
         "recently_rejected".into(),
         GateResult {
@@ -182,6 +189,11 @@ pub fn tier0(
             detail: if re_rejected {
                 format!(
                     "`{}` was rejected within the last 7 days; re-proposal blocked",
+                    proposal.skill_name
+                )
+            } else if rejected.contains(&proposal.skill_name) {
+                format!(
+                    "recent rejection recorded, but `{}` is deployed — patch proposals allowed",
                     proposal.skill_name
                 )
             } else {
@@ -960,6 +972,71 @@ mod tests {
 
         // A closed proposal cannot be denied again.
         assert!(deny(&cfg, &ledger, "prop_n_1").is_err());
+    }
+
+    #[test]
+    fn recently_rejected_does_not_mute_a_deployed_skill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+        let ledger = StateLedger::open(&cfg.state_db).expect("ledger");
+
+        // A denied duplicate marks the name recently rejected...
+        stage_proposal(&cfg, "prop_r_1", "live-skill", "# live-skill\n\nv1.\n");
+        ledger
+            .insert_proposal("prop_r_1", "live-skill", &[])
+            .expect("insert");
+        ledger
+            .set_proposal_status("prop_r_1", "rejected", "{}")
+            .expect("status");
+        // ...but the skill is live: a sibling copy was accepted and deployed.
+        ledger
+            .record_deployment("live-skill", 1, "global", "prop_r_0")
+            .expect("deployment");
+
+        let p2 = stage_proposal(
+            &cfg,
+            "prop_r_2",
+            "live-skill",
+            "# live-skill\n\nv2 corrigendum.\n",
+        );
+        let skill_md = p2
+            .skill_markdown(&cfg.proposals_dir)
+            .expect("skill markdown");
+        let results = tier0(&cfg, &ledger, &p2, &skill_md, None, &[]).expect("tier0 runs");
+        let (_, gate) = results
+            .iter()
+            .find(|(name, _)| name == "recently_rejected")
+            .expect("recently_rejected gate ran");
+        assert!(gate.passed, "{}", gate.detail);
+        assert!(
+            gate.detail.contains("patch proposals allowed"),
+            "{}",
+            gate.detail
+        );
+
+        // Without a deployment the mute stands: a gate-rejected idea stays muted.
+        stage_proposal(&cfg, "prop_r_3", "ghost-skill", "# ghost-skill\n");
+        ledger
+            .insert_proposal("prop_r_3", "ghost-skill", &[])
+            .expect("insert");
+        ledger
+            .set_proposal_status("prop_r_3", "rejected", "{}")
+            .expect("status");
+        let p3 = stage_proposal(&cfg, "prop_r_4", "ghost-skill", "# ghost-skill\n\nv2.\n");
+        let skill_md = p3
+            .skill_markdown(&cfg.proposals_dir)
+            .expect("skill markdown");
+        let results = tier0(&cfg, &ledger, &p3, &skill_md, None, &[]).expect("tier0 runs");
+        let (_, gate) = results
+            .iter()
+            .find(|(name, _)| name == "recently_rejected")
+            .expect("recently_rejected gate ran");
+        assert!(!gate.passed, "undeployed skill must stay muted");
+        assert!(
+            gate.detail.contains("re-proposal blocked"),
+            "{}",
+            gate.detail
+        );
     }
 
     #[test]

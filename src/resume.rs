@@ -38,6 +38,13 @@ pub fn fallback_resume_cwd(source_dir: &str) -> String {
     }
 }
 
+/// Select a resume directory using the environment of the machine that owns
+/// the session. Remote callers must use its result without applying local roots.
+pub fn resume_cwd(cwd: Option<String>, source_dir: &str) -> String {
+    cwd.filter(|dir| !dir.is_empty() && !is_state_store_dir(dir))
+        .unwrap_or_else(|| fallback_resume_cwd(source_dir))
+}
+
 /// The configured template for a source, falling back to built-in defaults.
 /// `remote` skips the local PATH probe for sessions resumed over SSH.
 pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) -> Option<String> {

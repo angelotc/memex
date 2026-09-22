@@ -5404,11 +5404,7 @@ pub(crate) fn session_resume_command(
     let source_dir = source_dir_of(&row.source_path);
     // Transcript stores are never workspaces: falling back into one makes the
     // resumed CLI ask the user to trust an agent's internal state directory.
-    let cwd = row
-        .cwd
-        .clone()
-        .filter(|dir| !crate::resume::is_state_store_dir(dir))
-        .unwrap_or_else(|| crate::resume::fallback_resume_cwd(&source_dir));
+    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {

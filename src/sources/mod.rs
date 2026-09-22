@@ -330,7 +330,13 @@ pub fn is_state_store_dir(dir: &Path) -> bool {
 fn state_store_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.extend(crate::config::default_claude_sources());
-    roots.extend(codex::homes());
+    // CODEX_HOME also owns real workspaces under worktrees/. Only its
+    // transcript directories are unsafe resume destinations.
+    roots.extend(
+        codex::homes()
+            .into_iter()
+            .flat_map(|home| [home.join("sessions"), home.join("archived_sessions")]),
+    );
     roots.push(cursor::projects_root());
     roots.extend(opencode::data_roots());
     roots.push(pi::sessions_root());
@@ -451,6 +457,12 @@ mod tests {
         )));
         assert!(is_state_store_dir(
             &temp.path().join("CODEX_HOME/sessions/2026/09")
+        ));
+        assert!(is_state_store_dir(
+            &temp.path().join("CODEX_HOME/archived_sessions/2026/09")
+        ));
+        assert!(!is_state_store_dir(
+            &temp.path().join("CODEX_HOME/worktrees/24d4/memex")
         ));
         assert!(is_state_store_dir(
             &temp.path().join("CLAUDE_CONFIG_DIR/projects/encoded-slug")

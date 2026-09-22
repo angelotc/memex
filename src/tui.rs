@@ -2591,22 +2591,29 @@ impl App {
             return Ok(());
         };
         let cwd = if remote {
-            session_context(
+            let context = match session_context(
                 &self.paths,
                 &self.config,
                 &session.machine,
                 &session.session_id,
                 &session.source_path,
-            )
-            .ok()
-            .and_then(|context| context.cwd)
+            ) {
+                Ok(context) => context,
+                Err(err) => {
+                    self.set_status(format!("cannot resolve remote resume directory: {err}"));
+                    return Ok(());
+                }
+            };
+            let Some(cwd) = context.resume_cwd.filter(|dir| !dir.is_empty()) else {
+                self.set_status(
+                    "remote resume directory unavailable; update memex on the remote machine",
+                );
+                return Ok(());
+            };
+            cwd
         } else {
-            resolve_session_cwd(&session)
-        }
-        // Transcript stores are never workspaces: falling back into one makes
-        // the resumed CLI ask the user to trust an agent's internal state.
-        .filter(|dir| !crate::resume::is_state_store_dir(dir))
-        .unwrap_or_else(|| crate::resume::fallback_resume_cwd(&session.source_dir));
+            crate::resume::resume_cwd(resolve_session_cwd(&session), &session.source_dir)
+        };
         let local_command = expand_resume_template(&template, &session, &cwd);
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)

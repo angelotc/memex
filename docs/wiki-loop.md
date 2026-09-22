@@ -127,6 +127,13 @@ with a status badge and full preview (metadata, SKILL.md, diff, purpose) — `a`
 a validated proposal (same Tier-3 path as `memex wiki-loop apply`), `d` denies it
 (status → rejected, audited in `skill-impact.md`, no files deployed).
 
+Applying also **propagates** the skill: `skills_root` stays the canonical store, and
+the applied skill is symlinked into every harness discovery root (`~/.claude/skills`,
+`~/.codex/skills`, `~/.gemini/skills`, `~/.gemini/config/skills`, `~/.agents/skills`,
+`~/.config/opencode/skills` — override with the `harness_skill_roots` key). A root
+that doesn't exist is created; a hand-authored skill of the same name is never
+clobbered (reported as skipped). Rollback removes the links it created.
+
 ## Commands
 
 ```bash

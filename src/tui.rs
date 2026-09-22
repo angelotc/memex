@@ -8885,6 +8885,8 @@ mod tests {
             wiki_root: tmp.path().join("wiki"),
             skills_root: tmp.path().join("skills"),
             proposals_dir: tmp.path().join("proposals"),
+            // The TUI approve path deploys — never link into the real harness roots.
+            harness_skill_roots: Vec::new(),
             ..crate::wiki_loop::config::WikiLoopConfig::default()
         }
     }

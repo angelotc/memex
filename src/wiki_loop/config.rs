@@ -75,6 +75,12 @@ pub struct WikiLoopConfig {
     /// (`project:<name>`), not by partitioned stores. Explicit `wiki_root` /
     /// `skills_root` keys still override.
     pub workspace_root: Option<PathBuf>,
+    /// Harness skill roots that a deployed skill is symlinked into on apply (and
+    /// unlinked on rollback) — the loop's `skills_root` is its canonical store, but
+    /// every CLI harness discovers skills from its own directory. A root that does
+    /// not exist is created; a pre-existing non-symlink entry of the same skill name
+    /// is never clobbered. Empty disables propagation.
+    pub harness_skill_roots: Vec<PathBuf>,
     /// Quiet window a session must sit through (after ending) before the maintainer claims it.
     pub quiet_minutes: i64,
     /// How far back the collector sweep looks for ended-but-uncompiled sessions, in days.
@@ -121,6 +127,21 @@ impl Default for WikiLoopConfig {
                 .join(".agents/skills"),
             proposals_dir: state_dir.join("proposals"),
             workspace_root: None,
+            harness_skill_roots: [
+                ".claude/skills", // claude (opencode reads this too)
+                ".codex/skills",
+                ".gemini/skills", // agy
+                ".gemini/config/skills",
+                ".agents/skills", // cross-harness standard
+                ".config/opencode/skills",
+            ]
+            .iter()
+            .map(|rel| {
+                dirs_next_home()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join(rel)
+            })
+            .collect(),
             quiet_minutes: 20,
             collect_lookback_days: 7,
             min_turns: 3,
@@ -154,6 +175,7 @@ struct ConfigFile {
     skills_root: Option<String>,
     proposals_dir: Option<String>,
     workspace_root: Option<String>,
+    harness_skill_roots: Option<Vec<String>>,
     quiet_minutes: Option<i64>,
     collect_lookback_days: Option<i64>,
     min_turns: Option<i64>,
@@ -218,6 +240,12 @@ impl WikiLoopConfig {
         expand!(cfg.wiki_root, file.wiki_root);
         expand!(cfg.skills_root, file.skills_root);
         expand!(cfg.proposals_dir, file.proposals_dir);
+        if let Some(roots) = file.harness_skill_roots {
+            cfg.harness_skill_roots = roots
+                .iter()
+                .map(|r| expand_home(Path::new(r)))
+                .collect::<Result<Vec<_>>>()?;
+        }
 
         if let Some(v) = file.quiet_minutes {
             cfg.quiet_minutes = v;

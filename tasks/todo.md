@@ -127,5 +127,18 @@ Two VM restarts during `cargo test` builds (full dep rebuild after target/ wipes
 All cargo runs now: `-j 1`, `CARGO_PROFILE_TEST_DEBUG=0`, memory watchdog
 (/tmp/opencode/test-watchdog.sh, kills build under 1.8GB MemAvailable).
 
-## Review (fill after done)
+## Review (2026-09-22 16:33 — post-switch run audit)
+- ~10h on GLM-5.3-flash: 15 busy maintainer runs, 45 sessions → 31 patterns,
+  wiki 51 → 64, ZERO errors since the switch (all 4 morning errors were pre-switch
+  agy: 3× structured_output parse + 1× quota).
+- Proposer's first GLM fire (12:20) produced a genuine corrigendum: two new
+  corroborations show the shipped \\x27 hex-escape technique FAILS — but it was
+  muted 7 days by recently_rejected (the morning's denied duplicate).
+- Fixed + deployed (0ebeee2): recently_rejected exempts skills with a live
+  deployment (patch path open; dedup still blocks identical content). Pinned by
+  recently_rejected_does_not_mute_a_deployed_skill. Next proposer tick 18:17
+  should re-propose the corrigendum and give the judge its first live GLM fire;
+  it will appear in the TUI skills screen if validated.
+- Loop quiet since ~10:40 (queue 0, all ticks idle-ok) — expected: ingest cron
+  keeps analytics fresh; sessions will sweep in as work happens.
 - Outcome of next proposer run post-install.

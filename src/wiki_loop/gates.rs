@@ -615,6 +615,66 @@ fn skills_backup_dir(cfg: &WikiLoopConfig) -> PathBuf {
         .join("skills_backup")
 }
 
+// ---- harness propagation: symlink deployed skills into every CLI's discovery root ----
+
+/// Symlink `skills_root/<skill>` into each harness root, following the box
+/// convention (`~/.claude/skills/build -> ~/.agents/skills/build`). Absolute
+/// targets keep unlink comparisons trivial. Idempotent; never clobbers a
+/// pre-existing non-symlink entry (that is someone's hand-authored skill).
+/// Returns (linked roots, skipped roots).
+fn link_skill_into_harnesses(
+    cfg: &WikiLoopConfig,
+    skill_name: &str,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let target = cfg.skills_root.join(skill_name);
+    let mut linked = Vec::new();
+    let mut skipped = Vec::new();
+    for root in &cfg.harness_skill_roots {
+        let link = root.join(skill_name);
+        match std::fs::symlink_metadata(&link) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let current = std::fs::read_link(&link).unwrap_or_default();
+                if current == target {
+                    continue; // already propagated
+                }
+                std::fs::remove_file(&link)
+                    .with_context(|| format!("replacing stale link {}", link.display()))?;
+            }
+            Ok(_) => {
+                skipped.push(link); // real file/dir: never clobber
+                continue;
+            }
+            Err(_) => {
+                std::fs::create_dir_all(root)
+                    .with_context(|| format!("creating harness root {}", root.display()))?;
+            }
+        }
+        std::os::unix::fs::symlink(&target, &link)
+            .with_context(|| format!("linking {}", link.display()))?;
+        linked.push(link);
+    }
+    Ok((linked, skipped))
+}
+
+/// Remove the propagation links for a rolled-back skill — only links that point
+/// into this loop's skills_root; anything else in the harness root stays.
+fn unlink_skill_from_harnesses(cfg: &WikiLoopConfig, skill_name: &str) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for root in &cfg.harness_skill_roots {
+        let link = root.join(skill_name);
+        if let Some(meta) = std::fs::symlink_metadata(&link).ok()
+            && meta.file_type().is_symlink()
+            && std::fs::read_link(&link)
+                .unwrap_or_default()
+                .starts_with(&cfg.skills_root)
+            && std::fs::remove_file(&link).is_ok()
+        {
+            removed.push(link);
+        }
+    }
+    removed
+}
+
 /// Paper step 16: the audit trail is appended programmatically after every decision.
 pub fn append_skill_impact(wiki_root: &Path, entry: &str) -> Result<()> {
     use std::io::Write;
@@ -713,11 +773,42 @@ pub fn apply(cfg: &WikiLoopConfig, ledger: &StateLedger, proposal_id: &str) -> R
             proposal.diff(&cfg.proposals_dir)?
         ),
     )?;
-    Ok(format!(
+    // Tier 3, delivery half: a skill on the loop's island reaches no agent —
+    // propagate it into every harness discovery root before calling it shipped.
+    let mut message = format!(
         "applied `{}` v{version} to {}",
         proposal.skill_name,
         skill_path.display()
-    ))
+    );
+    match link_skill_into_harnesses(cfg, &proposal.skill_name) {
+        Ok((linked, skipped)) => {
+            if !linked.is_empty() || !skipped.is_empty() {
+                append_skill_impact(
+                    &cfg.wiki_root,
+                    &format!(
+                        "- propagated: {} linked, {} skipped (pre-existing)\n",
+                        linked.len(),
+                        skipped.len()
+                    ),
+                )?;
+            }
+            if !linked.is_empty() {
+                message.push_str(&format!(", propagated to {} harness root(s)", linked.len()));
+            }
+            if !skipped.is_empty() {
+                message.push_str(&format!(
+                    " (skipped {}: pre-existing, not a symlink)",
+                    skipped.len()
+                ));
+            }
+        }
+        Err(e) => {
+            // The skill itself is applied; propagation is repairable by re-applying
+            // or linking by hand — report, don't fail the deployment.
+            message.push_str(&format!("; harness propagation failed: {e:#}"));
+        }
+    }
+    Ok(message)
 }
 
 /// Deny an open proposal from the review surface (TUI skills screen or CLI): the
@@ -804,16 +895,24 @@ pub fn rollback(cfg: &WikiLoopConfig, ledger: &StateLedger, skill_name: &str) ->
     }
     ledger.retire_deployments(skill_name)?;
 
+    // Roll the harness propagation links back too — only ours, only where they
+    // still point into this loop's skills root.
+    let removed_links = unlink_skill_from_harnesses(cfg, skill_name);
+
     append_skill_impact(
         &cfg.wiki_root,
         &format!(
-            "## {} — manual rollback — {} (was v{})\n- decision: reverted\n",
+            "## {} — manual rollback — {} (was v{})\n- decision: reverted\n- harness links removed: {}\n",
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             skill_name,
-            version
+            version,
+            removed_links.len()
         ),
     )?;
-    Ok(format!("rolled back `{skill_name}` (was v{version})"))
+    Ok(format!(
+        "rolled back `{skill_name}` (was v{version}; removed {} harness link(s))",
+        removed_links.len()
+    ))
 }
 
 fn read_if_exists(path: &Path) -> Option<String> {
@@ -831,6 +930,8 @@ mod tests {
             wiki_root: tmp.path().join("wiki"),
             skills_root: tmp.path().join("skills"),
             proposals_dir: tmp.path().join("proposals"),
+            // Default roots are the real harness dirs — tests must never link there.
+            harness_skill_roots: Vec::new(),
             ..WikiLoopConfig::default()
         }
     }
@@ -1037,6 +1138,60 @@ mod tests {
             "{}",
             gate.detail
         );
+    }
+
+    #[test]
+    fn apply_propagates_and_rollback_unlinks_harness_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_cfg(&tmp);
+        let claude_root = tmp.path().join("claude-skills");
+        let codex_root = tmp.path().join("codex-skills");
+        let guarded_root = tmp.path().join("guarded-skills");
+        cfg.harness_skill_roots = vec![
+            claude_root.clone(),
+            codex_root.clone(),
+            guarded_root.clone(),
+        ];
+        // A hand-authored skill of the same name must never be clobbered.
+        std::fs::create_dir_all(guarded_root.join("prop-skill")).expect("guarded dir");
+        std::fs::write(
+            guarded_root.join("prop-skill/SKILL.md"),
+            "# hand-authored\n",
+        )
+        .expect("hand SKILL.md");
+
+        let ledger = StateLedger::open(&cfg.state_db).expect("ledger");
+        let mut p = stage_proposal(&cfg, "prop_p_1", "prop-skill", "# prop-skill\n\nv1.\n");
+        assert!(validate_tier0(&cfg, &ledger, &mut p), "tier0 must pass");
+        let msg = apply(&cfg, &ledger, "prop_p_1").expect("apply");
+        assert!(msg.contains("propagated to 2 harness root(s)"), "{msg}");
+        assert!(msg.contains("skipped 1"), "{msg}");
+
+        let target = cfg.skills_root.join("prop-skill");
+        for root in [&claude_root, &codex_root] {
+            let link = root.join("prop-skill");
+            assert_eq!(std::fs::read_link(&link).expect("symlink"), target);
+        }
+        // The guarded hand-authored skill is untouched.
+        assert_eq!(
+            std::fs::read_to_string(guarded_root.join("prop-skill/SKILL.md")).expect("intact"),
+            "# hand-authored\n"
+        );
+
+        // Re-apply (v2) is idempotent: same single link per root, no duplicates.
+        let mut p2 = stage_proposal(&cfg, "prop_p_2", "prop-skill", "# prop-skill\n\nv2.\n");
+        assert!(validate_tier0(&cfg, &ledger, &mut p2));
+        apply(&cfg, &ledger, "prop_p_2").expect("apply v2");
+        assert_eq!(
+            std::fs::read_link(claude_root.join("prop-skill")).expect("still one link"),
+            target
+        );
+
+        // Rollback removes our links everywhere and leaves the guarded dir alone.
+        rollback(&cfg, &ledger, "prop-skill").expect("rollback");
+        assert!(!claude_root.join("prop-skill").exists());
+        assert!(!codex_root.join("prop-skill").exists());
+        assert!(guarded_root.join("prop-skill/SKILL.md").exists());
     }
 
     #[test]

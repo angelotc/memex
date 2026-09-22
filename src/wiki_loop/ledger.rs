@@ -266,15 +266,20 @@ impl StateLedger {
         Ok(names)
     }
 
-    pub fn proposals_since(&self, since_ms: i64) -> Result<u32> {
+    /// Proposals created since `since_ms` that consumed the human's attention budget —
+    /// everything except gate-rejected ones. The weekly ceiling exists because approval
+    /// fatigue defeats the human gate (a rejection never reached the human), so rejected
+    /// proposals must not spend it: counting them would mute the proposer for the week
+    /// with nothing reviewable to show, starving the reject→learn→retry loop.
+    pub fn reviewable_proposals_since(&self, since_ms: i64) -> Result<u32> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM proposals WHERE created_at >= ?",
+                "SELECT COUNT(*) FROM proposals WHERE created_at >= ? AND status != 'rejected'",
                 params![since_ms],
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n as u32)
-            .context("counting proposals")
+            .context("counting reviewable proposals")
     }
 
     /// Open proposals (pending/validated), newest first — the `status` review surface,
@@ -291,6 +296,33 @@ impl StateLedger {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Newest open (pending/validated) proposal staging `skill_name`, ignoring
+    /// `exclude_id` (the proposal currently being gated). The dedup gate consults
+    /// this: a validated-but-unapplied proposal is invisible to an active-skills
+    /// scan, yet re-proposing the same skill duplicates review work and burns the
+    /// weekly ceiling — the staged one must be applied or denied first.
+    pub fn open_proposal_for_skill(
+        &self,
+        skill_name: &str,
+        exclude_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT id, status FROM proposals
+                 WHERE skill_name = ? AND id != ?
+                   AND status IN ('pending', 'validated')
+                 ORDER BY created_at DESC LIMIT 1",
+                params![skill_name, exclude_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(anyhow::Error::from(other)),
+            })
+            .with_context(|| format!("looking up open proposals for `{skill_name}`"))
     }
 
     // ---- deployment ----
@@ -404,13 +436,81 @@ mod tests {
         let (led, _tmp) = ledger();
         led.insert_proposal("prop_1", "my-skill", &[])
             .expect("insert");
-        assert_eq!(led.proposals_since(now_ms() - 1000).expect("count"), 1);
+        led.insert_proposal("prop_2", "other-skill", &[])
+            .expect("insert");
+        assert_eq!(
+            led.reviewable_proposals_since(now_ms() - 1000)
+                .expect("count"),
+            2
+        );
+        // A gate rejection never reaches the human: it must not spend the ceiling.
         led.set_proposal_status("prop_1", "rejected", "{}")
             .expect("status");
+        assert_eq!(
+            led.reviewable_proposals_since(now_ms() - 1000)
+                .expect("count"),
+            1,
+            "rejected proposals must not count toward the weekly ceiling"
+        );
+        // ...but the recently-rejected dedup gate still sees it.
         assert_eq!(
             led.rejected_proposals_since(now_ms() - 1000)
                 .expect("rejected"),
             vec!["my-skill".to_string()]
+        );
+        // Validated proposals await human review: they do count.
+        led.set_proposal_status("prop_2", "validated", "{}")
+            .expect("status");
+        assert_eq!(
+            led.reviewable_proposals_since(now_ms() - 1000)
+                .expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn open_proposal_for_skill_sees_only_open_statuses() {
+        let (led, _tmp) = ledger();
+        led.insert_proposal("prop_staged", "dup-skill", &[])
+            .expect("insert");
+        led.set_proposal_status("prop_staged", "validated", "{}")
+            .expect("status");
+
+        // Self is excluded: validating the staged proposal itself must not trip dedup.
+        assert_eq!(
+            led.open_proposal_for_skill("dup-skill", "prop_staged")
+                .expect("lookup"),
+            None
+        );
+        // Another proposal for the same skill sees the staged one.
+        assert_eq!(
+            led.open_proposal_for_skill("dup-skill", "prop_other")
+                .expect("lookup"),
+            Some(("prop_staged".to_string(), "validated".to_string()))
+        );
+
+        // Rejected and accepted proposals are not open — deny/apply resolves the queue.
+        led.set_proposal_status("prop_staged", "rejected", "{}")
+            .expect("status");
+        assert_eq!(
+            led.open_proposal_for_skill("dup-skill", "prop_other")
+                .expect("lookup"),
+            None
+        );
+        led.set_proposal_status("prop_staged", "validated", "{}")
+            .expect("status");
+        led.set_proposal_status("prop_staged", "accepted", "{}")
+            .expect("status");
+        assert_eq!(
+            led.open_proposal_for_skill("dup-skill", "prop_other")
+                .expect("lookup"),
+            None
+        );
+        // Other skills are unaffected.
+        assert_eq!(
+            led.open_proposal_for_skill("other-skill", "prop_other")
+                .expect("lookup"),
+            None
         );
     }
 

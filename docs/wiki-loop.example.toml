@@ -41,6 +41,7 @@ max_chars_per_session     = 24576   # per-session summary cap (chars)
 max_chars_per_batch       = 163840  # per stratum (failing and passing each get this)
 subprocess_timeout_secs   = 1200    # one role invocation before the process-group kill
 max_proposals_per_week    = 3       # precision over recall: a quiet proposer is trusted
+                                     # (gate-rejected proposals don't count against it)
 min_pattern_corroboration = 2       # distinct sessions before a pattern can motivate a skill
 tier1_sessions            = 5       # historical sessions the counterfactual judge inspects
 

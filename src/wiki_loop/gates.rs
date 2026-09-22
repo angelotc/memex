@@ -139,18 +139,34 @@ pub fn tier0(
         },
     ));
 
-    // 4. Dedup: identical content already live.
+    // 4. Dedup: identical content already live, or the same skill already staged.
+    //    A validated-but-unapplied proposal does not exist as a skill yet, so an
+    //    active-skills scan alone would let the proposer mint a duplicate — the
+    //    staged one must be applied or denied before a re-proposal is reviewable.
+    let staged_duplicate = ledger.open_proposal_for_skill(&proposal.skill_name, &proposal.id)?;
     results.push((
         "dedup".into(),
-        match existing_skill {
-            Some(existing) if existing.trim() == skill_markdown.trim() => GateResult {
+        if let Some(existing) = existing_skill
+            && existing.trim() == skill_markdown.trim()
+        {
+            GateResult {
                 passed: false,
                 detail: "proposal duplicates the already-active skill".into(),
-            },
-            _ => GateResult {
+            }
+        } else if let Some((staged_id, staged_status)) = staged_duplicate {
+            GateResult {
+                passed: false,
+                detail: format!(
+                    "`{}` is already staged by {staged_id} ({staged_status}); \
+                     apply or deny it first",
+                    proposal.skill_name
+                ),
+            }
+        } else {
+            GateResult {
                 passed: true,
-                detail: "not a duplicate of the active skill".into(),
-            },
+                detail: "not a duplicate of the active skill or a staged proposal".into(),
+            }
         },
     ));
 
@@ -351,31 +367,44 @@ fn repo_root_for_project(cfg: &WikiLoopConfig, project: &str) -> Result<Option<P
 static MARKDOWN_CODE: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new("`([^`\\n]+)`").expect("static regex"));
 
-/// Tier 1 — counterfactual LLM judge over recent historical sessions. The replay set
-/// is the proposal's own project, or — for global proposals — the union across the
-/// projects that contributed the motivating patterns. A global proposal with no
-/// contributing scope fails closed: it would otherwise skip both real gates.
-pub fn tier1(
-    cfg: &WikiLoopConfig,
+/// The sessions the tier-1 judge replays: the corroborating (failure-mode) sessions
+/// stamped on the patterns that motivated the proposal come first — the judge's
+/// contract is "historical sessions that hit the failure mode" (prompts/judge.md) —
+/// then the most recent sessions of the relevant project(s) top the set up to
+/// `budget`. Recency alone puts mostly unrelated work in front of the judge, which
+/// fails global proposals by arithmetic rather than by judgment.
+fn replay_sessions(
+    analytics_db: &Path,
+    catalog: &BTreeMap<String, (PathBuf, super::patterns::PatternMeta)>,
     proposal: &Proposal,
-    skill_markdown: &str,
     contributing_scopes: &[String],
-) -> Result<Option<GateResult>> {
-    let sessions = match proposal.scope.strip_prefix("project:") {
-        Some(project) => {
-            let sessions = ingest::recent_sessions_for_project(
-                &cfg.analytics_db(),
-                project,
-                cfg.tier1_sessions,
-            )?;
-            if sessions.is_empty() {
-                return Ok(Some(GateResult {
-                    passed: false,
-                    detail: format!("no historical sessions found for project `{project}`"),
-                }));
+    budget: usize,
+) -> Result<Vec<ingest::SessionMeta>> {
+    // Failure-mode sessions: pattern page -> corroboration stamps -> session metas.
+    // Unknown pattern ids and sessions missing from the store fall through to the
+    // top-up below.
+    let mut sessions: Vec<ingest::SessionMeta> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for pattern_id in &proposal.purpose_patterns {
+        let Some((_, meta)) = catalog.get(pattern_id) else {
+            continue;
+        };
+        for c in &meta.corroboration {
+            if seen.insert((c.source.clone(), c.session_id.clone()))
+                && let Some(session) =
+                    ingest::get_session_meta(analytics_db, &c.source, &c.session_id)?
+            {
+                sessions.push(session);
             }
-            sessions
         }
+    }
+    sessions.sort_by_key(|meta| std::cmp::Reverse(meta.last_at));
+    sessions.truncate(budget);
+
+    // Recent top-up: the proposal's own project, or — for a global proposal — the
+    // union across the projects that contributed the motivating patterns.
+    let top_up: Vec<ingest::SessionMeta> = match proposal.scope.strip_prefix("project:") {
+        Some(project) => ingest::recent_sessions_for_project(analytics_db, project, budget)?,
         None => {
             let mut projects: Vec<&str> = contributing_scopes
                 .iter()
@@ -386,13 +415,58 @@ pub fn tier1(
             let mut union = Vec::new();
             for project in &projects {
                 union.extend(ingest::recent_sessions_for_project(
-                    &cfg.analytics_db(),
+                    analytics_db,
                     project,
-                    cfg.tier1_sessions,
+                    budget,
                 )?);
             }
-            if union.is_empty() {
-                return Ok(Some(GateResult {
+            // Each project's sessions are most-recent-first, the union is not; re-sort
+            // before the budget truncates the replay set.
+            union.sort_by_key(|meta| std::cmp::Reverse(meta.last_at));
+            union.truncate(budget);
+            union
+        }
+    };
+    for meta in top_up {
+        if sessions.len() >= budget {
+            break;
+        }
+        if seen.insert((meta.source.clone(), meta.session_id.clone())) {
+            sessions.push(meta);
+        }
+    }
+    Ok(sessions)
+}
+
+/// Tier 1 — counterfactual LLM judge over historical sessions that hit the failure
+/// mode (see [`replay_sessions`]). A proposal with neither corroborating sessions nor
+/// resolvable project history fails closed: it would otherwise skip both real gates.
+pub fn tier1(
+    cfg: &WikiLoopConfig,
+    proposal: &Proposal,
+    skill_markdown: &str,
+    contributing_scopes: &[String],
+) -> Result<Option<GateResult>> {
+    let catalog = super::patterns::PatternStore::new(&cfg.wiki_root)?.catalog()?;
+    let sessions = replay_sessions(
+        &cfg.analytics_db(),
+        &catalog,
+        proposal,
+        contributing_scopes,
+        cfg.tier1_sessions,
+    )?;
+    if sessions.is_empty() {
+        return Ok(Some(match proposal.scope.strip_prefix("project:") {
+            Some(project) => GateResult {
+                passed: false,
+                detail: format!("no historical sessions found for project `{project}`"),
+            },
+            None => {
+                let projects: Vec<&str> = contributing_scopes
+                    .iter()
+                    .filter_map(|s| s.strip_prefix("project:"))
+                    .collect();
+                GateResult {
                     passed: false,
                     detail: if projects.is_empty() {
                         "global scope with no contributing project patterns: set a `project:` \
@@ -405,15 +479,10 @@ pub fn tier1(
                             projects.join(", ")
                         )
                     },
-                }));
+                }
             }
-            // Each project's sessions are most-recent-first, the union is not; re-sort
-            // before the session budget truncates the replay set.
-            union.sort_by_key(|meta| std::cmp::Reverse(meta.last_at));
-            union.truncate(cfg.tier1_sessions);
-            union
-        }
-    };
+        }));
+    }
 
     let index_dir = cfg.index_dir()?;
     let mut digest = String::new();
@@ -609,6 +678,15 @@ pub fn apply(cfg: &WikiLoopConfig, ledger: &StateLedger, proposal_id: &str) -> R
     let mut proposal = proposal;
     proposal.status = "accepted".into();
     proposal.save(&cfg.proposals_dir)?;
+    // Mirror the decision into the ledger: the staged-proposals review surface
+    // (status output, TUI skills screen) reads statuses from state.db, and a
+    // still-`validated` row would keep an applied proposal queued for review —
+    // and make the dedup gate treat the skill as merely staged.
+    ledger.set_proposal_status(
+        &proposal.id,
+        "accepted",
+        &serde_json::to_string(&proposal.gates)?,
+    )?;
 
     append_skill_impact(
         &cfg.wiki_root,
@@ -628,6 +706,53 @@ pub fn apply(cfg: &WikiLoopConfig, ledger: &StateLedger, proposal_id: &str) -> R
         proposal.skill_name,
         skill_path.display()
     ))
+}
+
+/// Deny an open proposal from the review surface (TUI skills screen or CLI): the
+/// human looked at it and said no. Flips pending/validated → rejected — which the
+/// recently-rejected gate reads to mute re-proposals for its window — and records
+/// the decision in the audit trail. Nothing is written to the skills root.
+pub fn deny(cfg: &WikiLoopConfig, ledger: &StateLedger, proposal_id: &str) -> Result<String> {
+    let mut proposal = Proposal::load(&cfg.proposals_dir, proposal_id)?;
+    if proposal.id != proposal_id {
+        bail!("proposal id mismatch");
+    }
+    if proposal.status != "pending" && proposal.status != "validated" {
+        bail!(
+            "proposal is `{}`; only pending or validated proposals can be denied",
+            proposal.status
+        );
+    }
+    let previous_status = proposal.status.clone();
+    proposal.status = "rejected".into();
+    proposal.gates.insert(
+        "human_review".into(),
+        GateResult {
+            passed: false,
+            detail: format!(
+                "denied by human review at {} (was {previous_status})",
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+        },
+    );
+    proposal.save(&cfg.proposals_dir)?;
+    ledger.set_proposal_status(
+        proposal_id,
+        "rejected",
+        &serde_json::to_string(&proposal.gates)?,
+    )?;
+    append_skill_impact(
+        &cfg.wiki_root,
+        &format!(
+            "## {} — {} — {} (denied in review)\n- decision: rejected\n- was: {}\n- patterns: {}\n",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            proposal.id,
+            proposal.skill_name,
+            previous_status,
+            proposal.purpose_patterns.join(", ")
+        ),
+    )?;
+    Ok(format!("denied `{}` ({proposal_id})", proposal.skill_name))
 }
 
 /// Roll a skill back to its previous deployed version (rollback primacy; the wiki and
@@ -740,6 +865,101 @@ mod tests {
         proposal.status = if all_passed { "validated" } else { "rejected" }.into();
         proposal.save(&cfg.proposals_dir).expect("save proposal");
         all_passed
+    }
+
+    #[test]
+    fn tier0_dedup_fails_while_same_skill_is_staged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+        let ledger = StateLedger::open(&cfg.state_db).expect("ledger");
+
+        // A validated-but-unapplied proposal is already staged for this skill —
+        // invisible to an active-skills scan, but a duplicate nonetheless.
+        let p1 = stage_proposal(&cfg, "prop_d_1", "dup-skill", "# dup-skill\n\nv1.\n");
+        ledger
+            .insert_proposal("prop_d_1", "dup-skill", &[])
+            .expect("insert");
+        ledger
+            .set_proposal_status("prop_d_1", "validated", "{}")
+            .expect("status");
+
+        // A second proposal for the same skill fails dedup even with new content.
+        let p2 = stage_proposal(&cfg, "prop_d_2", "dup-skill", "# dup-skill\n\nv2.\n");
+        let skill_md = p2
+            .skill_markdown(&cfg.proposals_dir)
+            .expect("skill markdown");
+        let results = tier0(&cfg, &ledger, &p2, &skill_md, None, &[]).expect("tier0 runs");
+        let (_, dedup) = results
+            .iter()
+            .find(|(name, _)| name == "dedup")
+            .expect("dedup gate ran");
+        assert!(!dedup.passed, "staged duplicate must fail dedup");
+        assert!(
+            dedup.detail.contains("prop_d_1"),
+            "detail should point at the staged proposal: {}",
+            dedup.detail
+        );
+
+        // Re-validating the staged proposal itself must not trip its own gate.
+        let skill_md = p1
+            .skill_markdown(&cfg.proposals_dir)
+            .expect("skill markdown");
+        let results = tier0(&cfg, &ledger, &p1, &skill_md, None, &[]).expect("tier0 runs");
+        let (_, dedup) = results
+            .iter()
+            .find(|(name, _)| name == "dedup")
+            .expect("dedup gate ran");
+        assert!(dedup.passed, "{}", dedup.detail);
+
+        // Once the staged one is denied, a fresh proposal is reviewable again.
+        deny(&cfg, &ledger, "prop_d_1").expect("deny staged");
+        let skill_md = p2
+            .skill_markdown(&cfg.proposals_dir)
+            .expect("skill markdown");
+        let results = tier0(&cfg, &ledger, &p2, &skill_md, None, &[]).expect("tier0 runs");
+        let (_, dedup) = results
+            .iter()
+            .find(|(name, _)| name == "dedup")
+            .expect("dedup gate ran");
+        assert!(dedup.passed, "{}", dedup.detail);
+    }
+
+    #[test]
+    fn deny_rejects_open_proposal_and_audits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+        let ledger = StateLedger::open(&cfg.state_db).expect("ledger");
+
+        stage_proposal(&cfg, "prop_n_1", "deny-skill", "# deny-skill\n\nnope.\n");
+        ledger
+            .insert_proposal("prop_n_1", "deny-skill", &[])
+            .expect("insert");
+        ledger
+            .set_proposal_status("prop_n_1", "validated", "{}")
+            .expect("status");
+
+        let msg = deny(&cfg, &ledger, "prop_n_1").expect("deny");
+        assert!(msg.contains("deny-skill"), "{msg}");
+
+        // Out of the review surface, in both stores.
+        assert!(ledger.staged_proposals(10).expect("staged").is_empty());
+        let saved = Proposal::load(&cfg.proposals_dir, "prop_n_1").expect("reload");
+        assert_eq!(saved.status, "rejected");
+        let review = saved
+            .gates
+            .get("human_review")
+            .expect("human_review gate stamped");
+        assert!(review.detail.contains("denied by human review"));
+
+        // Nothing was deployed...
+        assert!(!cfg.skills_root.join("deny-skill/SKILL.md").exists());
+        // ...but the decision is audited.
+        let impact =
+            std::fs::read_to_string(cfg.wiki_root.join("skill-impact.md")).expect("impact");
+        assert!(impact.contains("denied in review"));
+
+        // A closed proposal cannot be denied again.
+        assert!(deny(&cfg, &ledger, "prop_n_1").is_err());
     }
 
     #[test]
@@ -935,6 +1155,93 @@ mod tests {
         // No expected sessions at all: fail closed.
         let r = judge_verdict(&v, &[]);
         assert!(!r.passed);
+    }
+
+    #[test]
+    fn tier1_replay_prefers_corroborating_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Analytics store: one corroborated (failure-mode) session and one newer,
+        // unrelated session in the contributing project.
+        let db = tmp.path().join("analytics.sqlite");
+        let conn = rusqlite::Connection::open(&db).expect("analytics db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 source TEXT, session_id TEXT, source_path TEXT, project TEXT,
+                 cwd TEXT, git_root TEXT, repo_project TEXT,
+                 started_at INTEGER, last_at INTEGER, message_count INTEGER,
+                 resolution_status TEXT
+             );
+             INSERT INTO sessions VALUES
+                 ('claude', 'sess_old', '', 'demo', '', '', 'demo', 900, 1000, 5, 'failing'),
+                 ('agy',    'sess_new', '', 'demo', '', '', 'demo', 1900, 2000, 9, 'passing');",
+        )
+        .expect("seed sessions");
+
+        // Wiki pattern page whose corroboration cites the failure-mode session.
+        let wiki = tmp.path().join("wiki");
+        std::fs::create_dir_all(wiki.join("patterns")).expect("patterns dir");
+        std::fs::write(
+            wiki.join("patterns/demo-failure.md"),
+            "---\nid: pat_demo\ntitle: \"Demo Failure\"\nstatus: candidate\nkind: failure\n\
+             scope: project:demo\ncreated: 2026-09-21T00:00:00Z\nupdated: 2026-09-21T00:00:00Z\n\
+             corroboration:\n  - source: claude, session_id: sess_old, ts: 1000\n\
+             superseded_by: null\nscrub_pass: v1\n---\n\n## Symptom\nDemo.\n",
+        )
+        .expect("pattern page");
+        let catalog = super::super::patterns::PatternStore::new(&wiki)
+            .expect("store")
+            .catalog()
+            .expect("catalog");
+        assert!(catalog.contains_key("pat_demo"), "pattern page must parse");
+
+        let proposal = Proposal {
+            id: "prop_r_1".into(),
+            created_at: now_ms(),
+            skill_name: "replay-skill".into(),
+            description: "d".into(),
+            status: "pending".into(),
+            scope: "global".into(),
+            purpose_patterns: vec!["pat_demo".into()],
+            rationale: "r".into(),
+            gates: Default::default(),
+        };
+        let scopes = vec!["project:demo".to_string()];
+
+        // Corroborating session leads even though the top-up session is more recent.
+        let replay = replay_sessions(&db, &catalog, &proposal, &scopes, 5).expect("replay set");
+        let ids: Vec<&str> = replay.iter().map(|m| m.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["sess_old", "sess_new"],
+            "failure-mode session first"
+        );
+
+        // Budget of one keeps the corroborated session and drops the top-up.
+        let replay = replay_sessions(&db, &catalog, &proposal, &scopes, 1).expect("replay set");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].session_id, "sess_old");
+
+        // A pattern citing both sessions dedupes against the top-up entirely.
+        std::fs::write(
+            wiki.join("patterns/demo-failure.md"),
+            "---\nid: pat_demo\ntitle: \"Demo Failure\"\nstatus: candidate\nkind: failure\n\
+             scope: project:demo\ncreated: 2026-09-21T00:00:00Z\nupdated: 2026-09-21T00:00:00Z\n\
+             corroboration:\n  - source: claude, session_id: sess_old, ts: 1000\n  \
+             - source: agy, session_id: sess_new, ts: 2000\n\
+             superseded_by: null\nscrub_pass: v1\n---\n\n## Symptom\nDemo.\n",
+        )
+        .expect("pattern page");
+        let catalog = super::super::patterns::PatternStore::new(&wiki)
+            .expect("store")
+            .catalog()
+            .expect("catalog");
+        let replay = replay_sessions(&db, &catalog, &proposal, &scopes, 5).expect("replay set");
+        assert_eq!(
+            replay.len(),
+            2,
+            "no duplicate when corroborated also recurs in top-up"
+        );
     }
 
     #[test]

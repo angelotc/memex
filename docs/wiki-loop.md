@@ -48,10 +48,14 @@ The stages follow the paper's Algorithm 1:
 4. **Propose** — the Skill Proposer reads the wiki index and the
    `skill-impact.md` audit trail **first** (so rejected interventions are never re-proposed),
    then corroborated patterns and active skills, and emits at most one **atomic** single-skill
-   proposal. A global weekly ceiling bounds proposal fatigue.
+   proposal. A global weekly ceiling bounds proposal fatigue; only proposals that
+   survive gating to human review count against it — gate rejections never reached
+   the human, so they must not spend the budget.
 5. **Gate** — Tier 0 static hygiene (secret rescan, slug, scope stamp, dedup,
    recently-rejected, referenced-path existence — checked against the contributing projects,
-   failing closed), then a Tier 1 counterfactual judge whose assessments are reconciled
+   failing closed), then a Tier 1 counterfactual judge that replays the motivating
+   patterns' corroborating (failure-mode) sessions first, topped up with recent project
+   history; its assessments are reconciled
    one-to-one against the sessions actually digested.
 6. **Apply / roll back** — a human applies a validated proposal; every decision (including
    `validate` rejections) is appended to `skill-impact.md`. Skills revert to the prior
@@ -104,8 +108,10 @@ memex wiki-loop init --workspace /apps --install-cron
 
 That writes `~/.memex/wiki-loop.toml` when absent (everything in it is optional —
 defaults live in the binary), creates the wiki and skills directories, installs the
-marked crontab block (maintainer every 30 min, proposer every 6 h, running the exact
-binary `init` was invoked through), and finishes with a doctor check. Re-running is
+marked crontab block (maintainer every 5 min, proposer every 6 h, and an incremental
+`memex index` every 10 min so the analytics store stays fresh even when no memex
+command runs — the loop only reads it, something has to feed it), running the exact
+binary `init` was invoked through. Re-running is
 idempotent; `--install-cron` replaces its own marked block without touching the rest of
 the crontab. Then compile what already happened and watch it go:
 
@@ -115,7 +121,11 @@ memex wiki-loop status           # queue depth, wiki growth, health
 ```
 
 In the TUI, press `alt+w` for the wiki browser (plain `w` once the results list has
-focus) and `s` from the wiki screen for deployed skills; both are read-only.
+focus) and `s` from the wiki screen for skills. The skills screen is the proposal
+review surface: staged proposals (pending/validated) are listed above applied skills
+with a status badge and full preview (metadata, SKILL.md, diff, purpose) — `a` applies
+a validated proposal (same Tier-3 path as `memex wiki-loop apply`), `d` denies it
+(status → rejected, audited in `skill-impact.md`, no files deployed).
 
 ## Commands
 
@@ -192,8 +202,9 @@ paths — cron has a minimal PATH), the equivalent block is:
 
 ```cron
 # BEGIN memex wiki-loop
-*/30 * * * * /usr/local/bin/memex wiki-loop run-maintainer >> ~/.local/state/wiki-loop/maintainer.log 2>&1
+*/5 * * * * /usr/local/bin/memex wiki-loop run-maintainer >> ~/.local/state/wiki-loop/maintainer.log 2>&1
 17 */6 * * * /usr/local/bin/memex wiki-loop run-proposer   >> ~/.local/state/wiki-loop/proposer.log 2>&1
+*/10 * * * * /usr/local/bin/memex --no-update-check --non-interactive index >> ~/.local/state/wiki-loop/index.log 2>&1
 # END memex wiki-loop
 ```
 

@@ -1,132 +1,131 @@
-# wiki-loop: implement glm-review fixes + per-project roots
+# wiki-loop: proposals reviewable in TUI + dedup fix + ingest cron
 
-Review verdict (tasks/glm-review.md): accurate — all 22 findings verified against
-src/wiki_loop/ and the paper (arXiv:2608.27454, §3.2.2/§3.2.3/§3.2.4, Alg. 1, App. C,
-prompts E.2/E.3). Fix everything P0–P2 plus the cheap P3s, and add per-project
-wiki/skills stores under a configurable projects root.
+## Why (session 2026-09-22)
+- Bug 1: tier0 `dedup` only compares against the live skills root; a validated-but-
+  unapplied proposal is invisible, so the proposer re-proposed
+  `python-inline-quote-escaping` twice (prop_1a0c5b727ed, prop_1a0c67b3572), burning
+  weekly ceiling slots and duplicating review work.
+- Review UX: approving/denying proposals requires CLI (`memex wiki-loop apply`); user
+  wants see/approve/deny in the TUI skills screen.
+- Raw-layer starvation: nothing schedules `memex index`; analytics.sqlite went stale
+  Sep 21 23:21 → Sep 22 05:40 (overnight sessions invisible to the loop) because
+  ingest only ran when a memex command happened to run.
 
-## Wave 1 — parallel subagents (disjoint files)
-
-- [x] A. scrub.rs — F19 secret shapes: Stripe (sk_/rk_/whsec_), unquoted env assigns,
-      JWTs, DB connection strings, AWS secret keys (label-gated), Slack webhooks,
-      `Authorization: Basic`. Tests per shape + FP sanity.
-- [x] B. harness.rs — F20 process-group kill (process_group(0) + kill(-pgid, SIGKILL)).
-- [x] C. patterns.rs + prompts/maintainer.md — F4 (create-on-existing-slug promotes to
-      merge; quarantine never clobbers), F11 (merge: empty section keeps prior text),
-      F18 (frontmatter sanitization: one-line title, scope validation), `kind:
-      failure|success` field (F10 substrate), F22 test fixes (slug-fork case).
-- [x] D. gates.rs + ledger.rs — F1 (proposal-id validator allowing `_`), F2 (apply
-      requires all tier-0 gates, not a nonexistent "tier0" key), F8 (v1 rollback
-      restores backup, no remove_dir_all), F9 (next version from MAX over all rows),
-      F15 (global-scope fails closed: refs checked against contributing projects, tier1
-      judges the union), F16 (judge assessments reconciled against digested sessions),
-      F21 (stale `running` runs marked error on open). New gates test module covering
-      validate → apply → rollback end to end.
-
-## Wave 2 — core wiring (orchestrator)
-
-- [x] F3 — remove the staging/live split: maintainer writes the live wiki; drop
-      `--live` and `wiki_staging` config; fix docs cron.
-- [x] F5 — maintainer output: `patterns` required (no serde default); empty patterns +
-      empty summary = error, never ack.
-- [x] F6 — empty/partial index reads fall back to raw transcript, else nack (retry),
-      never silently "ok".
-- [x] F7 — ack before mark_processed; `compiled_last_event_at` column so resumed
-      sessions recompile their new turns.
-- [x] F10 — stratified sampling per paper App. C: ≤5 failing + ≤3 passing sessions per
-      run (FIFO); passing digests built for strategy extraction; success patterns.
-- [x] F11 — maintainer prompt receives full pattern page bodies (bounded), not a
-      one-line catalog.
-- [x] F13 — `validate` appends to skill-impact.md on status change.
-- [x] F14 — role locks: proposer takes "proposer" + shared "wiki" lock; maintainer
-      takes "maintainer" + "wiki"; validate/apply/rollback take "delivery".
-- [x] F17 — materialize embedded JSON schemas; pass schema_path where role.json_schema.
-- [x] F21 — written counts only successful ops; all-ops-fail run = error (breaker);
-      per-pattern provenance (session → patterns it actually evidenced).
-- [x] F22 — error markers matched against tool output only (not assistant prose);
-      char-consistent truncation.
-- [x] F12 — document the one-shot-proposer divergence in docs/wiki-loop.md.
-
-## Workspace-root redesign (user correction)
-
-Per-project stores were superseded the same day: "i dont want per-project stores.
-i want the root /apps to be the wiki and skilsl base."
-
-- [x] `workspace_root` config (e.g. /apps) re-bases the defaults to `<root>/wiki` and
-      `<root>/skills`; explicit `wiki_root` / `skills_root` keys still win.
-- [x] Removed `projects_root`, `project_skills_subdir`, `wiki_dir(project)`,
-      `skills_dir(scope)`, `resolve_project`, `known_project_stores`, and
-      `Proposal.wiki_project` (−400 lines across config/cli/proposer/gates/ledger).
-- [x] Attribution stays via scope stamps (`project:<name>` on patterns/proposals);
-      diverging pattern scopes widen a proposal to `global`, where the strictest
-      fail-closed gates apply, instead of pinning an arbitrary project.
-- [x] Maintainer: one stratified batch per run (no per-project grouping); proposer:
-      one proposal opportunity per run under the global weekly ceiling.
-- [x] status/doctor show the workspace root; doctor fails when a configured root is
-      missing.
-
-## Wave 3 — verify + ship
-
-- [x] cargo fmt --check, cargo clippy -- -D warnings, cargo test (all green;
-      CARGO_TARGET_DIR=/mnt/HC_Volume_106441424/caches/target, jobs capped at 2).
-- [x] docs/wiki-loop.md updated (cron without --live, per-project layout, new
-      divergences, unredacted-traces-to-models note).
-- [x] Commit (no attribution lines, per repo rule).
-
-## Collector + install UX (user goal)
-
-- [x] `collect.rs` sweep: ended (quiet ≥ quiet window), uncompiled, inside
-      `collect_lookback_days` (default 7, 0 = all) sessions enqueue themselves from
-      analytics before each maintainer run — no per-harness hooks needed. Entry stamps
-      carry the session's real `last_at`; identical upserts skip the disk write.
-- [x] `wiki-loop init [--workspace] [--install-cron] [--force]`: scaffold config
-      (defaults live in the binary), create wiki/skills dirs, install the marked cron
-      block via `crontab -` (idempotent splice of its own BEGIN/END block), run doctor.
-- [x] README section + docs install section; Reference table row.
-- [x] TUI wiki/skills browser (`w`): two-pane reader over patterns (scope-stamped),
-      index/logs/skill-impact, and deployed skills; markdown via the existing preview
-      pipeline; mouse + narrow-stack layout; 4 new tests (subagent implementation).
+## Changes
+- [x] ledger.rs: `open_proposal_for_skill(skill, exclude_id)` → newest
+      pending/validated proposal id+status for a skill name.
+- [x] gates.rs tier0 dedup: fail when an open (pending/validated) proposal already
+      stages the same skill; detail points at its id ("apply or deny it first").
+- [x] gates.rs: `pub fn deny(cfg, ledger, id)` — pending/validated → rejected, stamps
+      a `human_review` gate note, appends skill-impact.md audit entry (mirror of apply).
+- [x] gates.rs apply(): mirrors "accepted" into the ledger (was proposal.json-only —
+      the review surface kept applied proposals staged forever, and dedup would have
+      blocked legitimate v2 re-proposals of an applied skill).
+- [x] tui.rs: `WikiEntryKind::Proposal` (+id/status fields on WikiEntry);
+      `load_skill_entries` appends staged proposals (ledger) above applied skills;
+      proposal list rows show status badge; preview shows meta header + SKILL.md +
+      skill.diff + PURPOSE.md; `a` approve (validated only) / `d` deny in
+      `handle_skills_key` with delivery lock for approve; footer hints; empty-note
+      text; App caches `wiki_loop_config` for test injectability.
+- [x] cli.rs `install_cron_schedule`: maintainer cadence matches live */5; added
+      `*/10 * * * * {exe} --no-update-check --non-interactive index` (index.log).
+- [x] harness.rs `unwrap_envelope`: probe `structured_output` (schema-enforced
+      object) before scraping prose `response` — the live breaker-tripper was agy
+      filling structured_output while response drifted brace-free.
+- [x] docs: wiki-loop.md (ingest cron, TUI review keys, cron block example).
+- [x] Tests: ledger open-proposal lookup; dedup fails on staged duplicate + clears
+      after deny; deny() semantics; TUI list/apply/deny/pending-guard key paths;
+      harness structured_output unwrap (object wins over prose; null keeps old error).
+- [x] Verify: fmt ✅, clippy -D warnings ✅, full lib suite 1113 passed / 0 failed.
+- [x] Deploy: rebuilt, installed to /root/.local/bin/memex-wiki-loop (backup
+      .pre-tui-review.bak), `wiki-loop init --install-cron` refreshed the live block;
+      ingest cron proven live (06:30 + 06:40 ticks in index.log; collector swept 16
+      sessions into the queue).
 
 ## Review
+- All three asks shipped: dedup no longer blind to staged proposals; the skills
+  screen lists proposals with a status badge + full preview and a=approve / d=deny
+  (delivery lock, audit trail, auto-refresh); ingest cron every 10 min keeps the
+  analytics store fresh without a memex command having to run.
+- Extra fixes surfaced by testing: apply() ledger mirror, harness structured_output
+  unwrap (the "model output carried no JSON" breaker-tripper).
+- VM died ~06:27 after the first build: the proposer's 06:17 agy run spiked on top
+  of post-build pressure (see lessons.md — watchdog floor back at 1800MB, build
+  windows picked around proposer ticks, MALLOC_ARENA_MAX=1 for link-heavy steps).
+- BLOCKED (environment): agy individual quota exhausted (429, resets ~02:41 UTC
+  Sep 23). 17 sessions queued; breaker tripped. After the quota resets, run
+  `memex-wiki-loop wiki-loop run-maintainer --force` once — on success the loop
+  resumes on its own 5-min ticks. TUI proposal review needs no model and works now:
+  two validated `python-inline-quote-escaping` proposals are staged — deny the older
+  prop_1a0c5b727ed and keep prop_1a0c67b3572 (or approve it directly).
+- Committed as one commit (the earlier tier-1 replay + ceiling rework and this
+  session's review surface + cron + harness fix share hunks in gates/ledger/cli;
+  splitting inside hunks risked the validated tree) and pushed to origin/wiki-loop.
+- Model switch (2026-09-22, user request): all three roles now run
+  opencode + zai-coding-plan/glm-5.3-flash#high (`run - --format default --auto`,
+  json_schema=false — no --json-schema flag in opencode; prompts demand JSON,
+  harness scrapes). agy+gemini wiring kept as commented example in
+  ~/.memex/wiki-loop.toml (backup .pre-glm.bak). Digest budgets rescaled from the
+  gemini-1M sizing (96KB/800KB) to 24KB/160KB per stratum. First live GLM run:
+  11 sessions → 9 pattern ops in 7m43s, breaker cleared, health ok. TUI review
+  proven by the user: prop_1a0c67b3572 accepted (first skill deployed to
+  /apps/skills/python-inline-quote-escaping), duplicate prop_1a0c5b727ed denied.
+---
 
-All 22 review findings addressed (F1–F22). Verification: `cargo fmt --check` clean,
-`cargo clippy --lib -- -D warnings` clean, `cargo test --lib` **1085 passed / 0
-failed** (wiki_loop suite grew 32 → 67 tests, including a new gates module covering
-validate → apply → rollback → re-apply end to end). Binary smoke-tested
-(`memex wiki-loop --help`).
+# wiki-loop: unblock skill creation (fixes A + B) + live config
 
-Bonus defects found and fixed beyond the review:
+## Why
+Three proposals (Sep 20–21) were all auto-rejected; the weekly ceiling then counted
+those rejections and muted the proposer until Sep 27. Root causes fact-checked
+against the WikiSkill paper and docs/wiki-loop.md:
 
-1. **The maintainer prompt had no `{digest}` placeholder at all** — cli.rs's
-   `.replace("{digest}", …)` was a no-op, so the model never saw the catalog or the
-   trace digest. Every maintenance run ran blind. (Found by the patterns agent; now one
-   explicit placeholder + JSON-schema enforcement of the output shape.)
-2. `Record` is not `Clone`, so the per-project grouping initially cloned a `&Vec` by
-   accident — caught by compile, fixed by consuming the map.
+- **A (root cause):** `gates.rs::tier1` feeds the judge the most-*recent* sessions of
+  contributing projects, not the failure-mode sessions named in the proposal's
+  patterns. Judge contract (prompts/judge.md, docs/wiki-loop.md:69) says "sessions
+  that hit the failure mode" → both tier1 rejections judged irrelevant sessions.
+- **B:** `ledger.rs::proposals_since` counts rejected proposals toward
+  `max_proposals_per_week`; rejections never reach the human, so the ceiling burns
+  budget with no approval and starves the paper's reject→retry loop.
+- **Config:** live proposer runs gemini-3.8-flash @ medium in `~/.memex/wiki-loop.toml`
+  (user's edit went to the dead Python rewrite config).
 
-Operational notes:
+## Changes
+- [x] A: `gates.rs` — replay set = corroborating sessions of `purpose_patterns`
+      (PatternStore catalog → corroboration {source, session_id} →
+      `ingest::get_session_meta`), newest-first, then top up with
+      `recent_sessions_for_project` to `tier1_sessions`. Empty-union fail-closed
+      details preserved. Project scope keeps its top-up source.
+- [x] A tests: corroborating sessions ordered ahead of recent top-up; unknown
+      patterns fall back to recent sessions. (`tier1_replay_prefers_corroborating_sessions`)
+- [x] B: `ledger.rs` — `proposals_since` → `reviewable_proposals_since`
+      (`status != 'rejected'`); call sites `proposer.rs:41`, `cli.rs` status.
+      `rejected_proposals_since` untouched (recently_rejected gate).
+- [x] B test: rejected proposal drops out of the weekly count but stays in
+      `rejected_proposals_since`; validated still counts.
+- [x] Config: `~/.memex/wiki-loop.toml` `[proposer] effort = "high"`.
+- [x] Docs: wiki-loop.md (ceiling counting + tier1 replay prose) and example.toml
+      comment updated; example-sync test only checks values → safe.
+- [x] Verify: `cargo fmt --check` ✅, `cargo clippy -- -D warnings` ✅,
+      `cargo test wiki_loop` ✅ (79 passed, incl. both new tests) — under watchdog.
+- [x] Rebuild + install: `target` lives on the mount (`CARGO_TARGET_DIR=
+      /mnt/HC_Volume_106441424/caches/target`), built `-j 1` in 1m50s, installed to
+      `/root/.local/bin/memex-wiki-loop` (old binary backed up as
+      `.v0.22.0.bak`). `wiki-loop status`: `proposals: 0/week reviewable (ceiling 3)`.
 
-- Live deployment: `workspace_root = "/apps"` in `~/.memex/wiki-loop.toml`; wiki
-  migrated from `~/.memex/wiki` to `/apps/wiki` (old dir kept as
-  `~/.memex/wiki.pre-apps-backup`); cron installed via `wiki-loop init --install-cron`
-  (validated live: splices only its own marked block); logs rotate via
-  `/etc/logrotate.d/wiki-loop`. Refresh `/root/.local/bin/memex-wiki-loop` after every
-  rebuild — cron runs the static copy.
-- Collector live: first sweep enqueued 252 ended sessions (7-day lookback, 4 sources);
-  the queue drains 8 per run. One flaky maintainer parse failure (`missing field
-  patterns`) was retried successfully on the next run by design; parse errors now name
-  the received keys so the breaker error is diagnosable from `status` alone.
-- Six commits pushed to origin/wiki-loop (1315e06 → 27001d4), all attribution-free;
-  1094 lib tests green, fmt + clippy clean throughout.
-- The first push of the branch was rejected by GitHub push protection: the scrub.rs
-  test fixtures contained realistic Stripe-key-shaped literals. Fixed by assembling
-  the fixtures via `concat!` (regexes still fully exercised) and collapsing the four
-  never-pushed commits into one clean commit; `backup-wiki-loop-local` keeps the
-  pre-collapse local history.
-- The cache volume filled (31G, 100%) during the final link; cleared
-  `target/debug/incremental` (8.3G) — rebuilds are slower once, nothing else affected.
-- Known accepted limitations, documented in docs/wiki-loop.md: the proposer remains
-  one-shot (no ReAct trace access — declared divergence), merges are section-level
-  rather than span-level, and the digest sent to the role models is unredacted by
-  design (scrubbing protects the durable files).
+## Review
+- Root-cause fixes shipped: tier1 judge now replays failure-mode (corroborating)
+  sessions first with recent top-up; weekly ceiling counts only reviewable
+  (non-rejected) proposals; live proposer raised to gemini-3.8-flash @ high.
+- End-to-end proof (manual `run-proposer`, post-install): first proposal ever to
+  pass ALL gates — `python-inline-quote-escaping` (global, corroborated across 4
+  sessions) — `validated`, staged for human apply:
+  `memex wiki-loop apply prop_1a0c5b727ed_1a0c5b727edd2a260a3dc`
+- Cron ticks (proposer :17 every 6h) now operate unblocked.
 
+## Ops note (VM crashes)
+Two VM restarts during `cargo test` builds (full dep rebuild after target/ wipes).
+All cargo runs now: `-j 1`, `CARGO_PROFILE_TEST_DEBUG=0`, memory watchdog
+(/tmp/opencode/test-watchdog.sh, kills build under 1.8GB MemAvailable).
+
+## Review (fill after done)
+- Outcome of next proposer run post-install.

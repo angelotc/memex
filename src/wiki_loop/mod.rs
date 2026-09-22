@@ -21,11 +21,13 @@ pub use cli::WikiLoopCommand;
 mod collect;
 pub mod config;
 mod digest;
-mod gates;
+// gates/ledger/lock stay crate-internal but are shared with the TUI's proposal
+// review surface (skills screen approve/deny), which calls them in-process.
+pub(crate) mod gates;
 mod harness;
 mod ingest;
-mod ledger;
-mod lock;
+pub(crate) mod ledger;
+pub(crate) mod lock;
 mod notify;
 mod patterns;
 mod proposer;

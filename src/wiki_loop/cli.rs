@@ -719,8 +719,8 @@ fn run_status(cfg: &WikiLoopConfig) -> Result<()> {
     println!("skills:     {}", cfg.skills_root.display());
     let week_ago = now_ms() - 7 * 24 * 3_600_000;
     println!(
-        "proposals:  {}/week used (ceiling {}), staged at {}",
-        ledger.proposals_since(week_ago)?,
+        "proposals:  {}/week reviewable (ceiling {}), staged at {}",
+        ledger.reviewable_proposals_since(week_ago)?,
         cfg.max_proposals_per_week,
         cfg.proposals_dir.display()
     );
@@ -932,11 +932,13 @@ fn install_cron_schedule(cfg: &WikiLoopConfig) -> Result<()> {
         .context("state db has no parent directory")?;
     let block = format!(
         "# BEGIN memex wiki-loop (added by `memex wiki-loop init --install-cron`)\n\
-         */30 * * * * {exe} wiki-loop run-maintainer >> {m} 2>&1\n\
+         */5 * * * * {exe} wiki-loop run-maintainer >> {m} 2>&1\n\
          17 */6 * * * {exe} wiki-loop run-proposer >> {p} 2>&1\n\
+         */10 * * * * {exe} --no-update-check --non-interactive index >> {i} 2>&1\n\
          # END memex wiki-loop\n",
         m = state_dir.join("maintainer.log").display(),
         p = state_dir.join("proposer.log").display(),
+        i = state_dir.join("index.log").display(),
     );
 
     // `crontab -l` fails when no crontab exists yet — that is an empty starting point.
@@ -959,7 +961,7 @@ fn install_cron_schedule(cfg: &WikiLoopConfig) -> Result<()> {
     if !status.success() {
         bail!("crontab rejected the new schedule (exit {status})");
     }
-    println!("[ok] cron installed: maintainer every 30m, proposer every 6h");
+    println!("[ok] cron installed: maintainer every 5m, proposer every 6h, index every 10m");
     println!(
         "     logs under {} — add a logrotate drop-in if they grow (see docs)",
         state_dir.display()

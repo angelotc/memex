@@ -541,6 +541,7 @@ enum WikiEntryKind {
     Logs,
     Impact,
     Skill,
+    Proposal,
 }
 
 impl WikiEntryKind {
@@ -551,6 +552,7 @@ impl WikiEntryKind {
             WikiEntryKind::Logs => "logs",
             WikiEntryKind::Impact => "impact",
             WikiEntryKind::Skill => "skill",
+            WikiEntryKind::Proposal => "proposal",
         }
     }
 }
@@ -563,6 +565,10 @@ struct WikiEntry {
     description: Option<String>,
     kind: WikiEntryKind,
     path: PathBuf,
+    // Proposal entries carry their proposal id (for approve/deny) and ledger
+    // status; None for every other kind.
+    id: Option<String>,
+    status: Option<String>,
 }
 
 // Shared pane state for the wiki and skills browser screens. Only these
@@ -740,6 +746,9 @@ struct App {
     skills: BrowserState,
     wiki_return_mode: LayoutMode,
     skills_return_mode: LayoutMode,
+    // Wiki-loop config for the skills screen's proposal review actions; loaded
+    // lazily so tests can inject a tempdir-backed config instead of ~/.memex's.
+    wiki_loop_config: Option<crate::wiki_loop::config::WikiLoopConfig>,
     status: String,
     last_status_at: Option<Instant>,
     update_message: Option<String>,
@@ -1164,6 +1173,7 @@ impl App {
             skills: BrowserState::new(),
             wiki_return_mode: LayoutMode::List,
             skills_return_mode: LayoutMode::List,
+            wiki_loop_config: None,
             status: String::new(),
             last_status_at: None,
             update_message: None,
@@ -2334,6 +2344,17 @@ impl App {
         self.last_status_at = Some(Instant::now());
     }
 
+    /// The wiki-loop config for proposal review, loaded once and cached (tests
+    /// pre-seed it with a tempdir config to stay machine-independent).
+    fn wiki_loop_config_or_load(
+        &mut self,
+    ) -> Result<crate::wiki_loop::config::WikiLoopConfig, anyhow::Error> {
+        if self.wiki_loop_config.is_none() {
+            self.wiki_loop_config = Some(crate::wiki_loop::config::WikiLoopConfig::load(None)?);
+        }
+        Ok(self.wiki_loop_config.clone().expect("cached above"))
+    }
+
     fn clear_status_if_old(&mut self) -> bool {
         if let Some(at) = self.last_status_at
             && at.elapsed() > Duration::from_secs(4)
@@ -2765,7 +2786,20 @@ impl App {
                 self.wiki.entries.len()
             }
             LayoutMode::Skills => {
-                populate_browser(&mut self.skills, load_skill_entries, skills_empty_note);
+                // Prefer the cached config: a review action just used it, and
+                // re-reading disk mid-interaction can swap the list under the
+                // user (tests inject a tempdir config here).
+                match self.wiki_loop_config.clone() {
+                    Some(config) => populate_browser_with(
+                        &mut self.skills,
+                        load_skill_entries,
+                        skills_empty_note,
+                        &config,
+                    ),
+                    None => {
+                        populate_browser(&mut self.skills, load_skill_entries, skills_empty_note)
+                    }
+                }
                 self.skills.entries.len()
             }
             _ => return,
@@ -3529,9 +3563,83 @@ fn handle_skills_key(key: KeyEvent, app: &mut App) -> Result<bool> {
         KeyCode::Char('w') => {
             app.hop_to_wiki();
         }
+        // Proposal review (the Tier-3 human gate) without leaving the TUI.
+        KeyCode::Char('a') => {
+            review_proposal(app, ProposalAction::Approve);
+        }
+        KeyCode::Char('d') => {
+            review_proposal(app, ProposalAction::Deny);
+        }
         _ => return handle_browser_key(key, app),
     }
     Ok(false)
+}
+
+#[derive(Clone, Copy)]
+enum ProposalAction {
+    Approve,
+    Deny,
+}
+
+/// Apply (approve) or reject (deny) the selected proposal in-process — same gates,
+/// locks, and audit trail as `memex wiki-loop apply` / a manual rejection. The
+/// outcome lands in the status line and the browser reloads, so an approved skill
+/// replaces its proposal row.
+fn review_proposal(app: &mut App, action: ProposalAction) {
+    let verb = match action {
+        ProposalAction::Approve => "approve",
+        ProposalAction::Deny => "deny",
+    };
+    let Some(entry) = app
+        .skills
+        .list
+        .selected()
+        .and_then(|idx| app.skills.entries.get(idx).cloned())
+    else {
+        app.set_status("nothing selected");
+        return;
+    };
+    if entry.kind != WikiEntryKind::Proposal {
+        app.set_status(format!("`{}` is not a proposal", entry.title));
+        return;
+    }
+    let status = entry.status.clone().unwrap_or_default();
+    if matches!(action, ProposalAction::Approve) && status != "validated" {
+        app.set_status(format!(
+            "proposal `{}` is {status}; only validated proposals can be approved",
+            entry.title
+        ));
+        return;
+    }
+    let Some(id) = entry.id.clone() else {
+        app.set_status("proposal entry carries no id".to_string());
+        return;
+    };
+    let cfg = match app.wiki_loop_config_or_load() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            app.set_status(format!("couldn't load wiki config: {err:#}"));
+            return;
+        }
+    };
+    let outcome = crate::wiki_loop::ledger::StateLedger::open(&cfg.state_db).and_then(|ledger| {
+        let Some(lock_dir) = cfg.state_db.parent().map(|p| p.join("locks")) else {
+            anyhow::bail!("state db has no parent directory");
+        };
+        // The delivery lock serializes against a concurrent CLI apply/rollback.
+        let _guard = crate::wiki_loop::lock::RoleLock::try_acquire(&lock_dir, "delivery")?;
+        match action {
+            ProposalAction::Approve => crate::wiki_loop::gates::apply(&cfg, &ledger, &id),
+            ProposalAction::Deny => crate::wiki_loop::gates::deny(&cfg, &ledger, &id),
+        }
+    });
+    match outcome {
+        Ok(message) => {
+            app.refresh_active_browser();
+            app.set_status(message);
+        }
+        Err(err) => app.set_status(format!("{verb} failed: {err:#}")),
+    }
 }
 
 // Wiki and skills share every browser key beyond the screen hops: pane
@@ -5244,6 +5352,30 @@ fn browser_entry_line(entry: &WikiEntry, theme: &Theme, width: u16) -> Line<'sta
         }
         return Line::from(spans);
     }
+    // Proposal rows lead with a status badge so the review queue reads at a glance.
+    if matches!(entry.kind, WikiEntryKind::Proposal) {
+        let status = entry.status.as_deref().unwrap_or("pending");
+        let badge_style = if status == "validated" {
+            theme.accent
+        } else {
+            theme.muted
+        };
+        let mut spans = vec![
+            Span::styled(format!("[{status}]"), badge_style),
+            Span::raw("  "),
+            Span::styled(entry.title.clone(), theme.text),
+        ];
+        if let Some(description) = entry.description.as_deref() {
+            let budget = (width as usize)
+                .saturating_sub(status.chars().count() + entry.title.chars().count() + 6);
+            let trimmed = truncate_end(description, budget);
+            if !trimmed.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(trimmed, theme.muted));
+            }
+        }
+        return Line::from(spans);
+    }
     let mut spans = vec![
         Span::styled(entry.kind.label(), theme.muted),
         Span::raw("  "),
@@ -5675,6 +5807,10 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
 
     if app.layout_mode == LayoutMode::Skills {
         return Line::from(vec![
+            Span::styled("a", theme.accent),
+            Span::styled(" approve  ", theme.muted),
+            Span::styled("d", theme.accent),
+            Span::styled(" deny  ", theme.muted),
             Span::styled("w", theme.accent),
             Span::styled(" wiki  ", theme.muted),
             Span::styled("↑↓", theme.accent),
@@ -6978,6 +7114,8 @@ fn load_wiki_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<W
                 description: None,
                 kind: WikiEntryKind::Pattern,
                 path,
+                id: None,
+                status: None,
             });
         }
     }
@@ -6995,6 +7133,8 @@ fn load_wiki_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<W
                 description: None,
                 kind,
                 path,
+                id: None,
+                status: None,
             });
         }
     }
@@ -7004,6 +7144,25 @@ fn load_wiki_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<W
 
 fn load_skill_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<WikiEntry> {
     let mut entries = Vec::new();
+    // Staged proposals lead the list: they are the review queue (a approve / d deny),
+    // newest first from the ledger. A proposal whose files vanished mid-review simply
+    // drops out on the next reload.
+    if let Ok(ledger) = crate::wiki_loop::ledger::StateLedger::open(&config.state_db) {
+        for (id, skill_name, status) in ledger.staged_proposals(100).unwrap_or_default() {
+            let description = crate::wiki_loop::gates::Proposal::load(&config.proposals_dir, &id)
+                .ok()
+                .map(|proposal| proposal.description);
+            entries.push(WikiEntry {
+                title: skill_name,
+                scope: None,
+                description,
+                kind: WikiEntryKind::Proposal,
+                path: config.proposals_dir.join(&id).join("SKILL.md"),
+                id: Some(id),
+                status: Some(status),
+            });
+        }
+    }
     let Ok(dir) = std::fs::read_dir(&config.skills_root) else {
         return entries;
     };
@@ -7027,6 +7186,8 @@ fn load_skill_entries(config: &crate::wiki_loop::config::WikiLoopConfig) -> Vec<
             description,
             kind: WikiEntryKind::Skill,
             path: path.join("SKILL.md"),
+            id: None,
+            status: None,
         });
     }
     entries
@@ -7039,20 +7200,8 @@ fn populate_browser(
     load: fn(&crate::wiki_loop::config::WikiLoopConfig) -> Vec<WikiEntry>,
     empty_note: fn(&crate::wiki_loop::config::WikiLoopConfig) -> String,
 ) {
-    browser.focus = Focus::List;
-    browser.scroll = 0;
-    browser.lines.clear();
     match crate::wiki_loop::config::WikiLoopConfig::load(None) {
-        Ok(config) => {
-            browser.entries = load(&config);
-            if browser.entries.is_empty() {
-                browser.list.select(None);
-                browser.lines = vec![PreviewLine::Text(empty_note(&config))];
-            } else {
-                browser.list.select(Some(0));
-                browser.update_content();
-            }
-        }
+        Ok(config) => populate_browser_with(browser, load, empty_note, &config),
         Err(err) => {
             browser.entries.clear();
             browser.list.select(None);
@@ -7060,6 +7209,28 @@ fn populate_browser(
                 "couldn't load wiki config: {err}"
             ))];
         }
+    }
+}
+
+/// [`populate_browser`] against a known config — the refresh path reuses the
+/// App's cached config (tests inject a tempdir-backed one) instead of
+/// re-reading `~/.memex/wiki-loop.toml` mid-interaction.
+fn populate_browser_with(
+    browser: &mut BrowserState,
+    load: fn(&crate::wiki_loop::config::WikiLoopConfig) -> Vec<WikiEntry>,
+    empty_note: fn(&crate::wiki_loop::config::WikiLoopConfig) -> String,
+    config: &crate::wiki_loop::config::WikiLoopConfig,
+) {
+    browser.focus = Focus::List;
+    browser.scroll = 0;
+    browser.lines.clear();
+    browser.entries = load(config);
+    if browser.entries.is_empty() {
+        browser.list.select(None);
+        browser.lines = vec![PreviewLine::Text(empty_note(config))];
+    } else {
+        browser.list.select(Some(0));
+        browser.update_content();
     }
 }
 
@@ -7072,7 +7243,8 @@ fn wiki_empty_note(config: &crate::wiki_loop::config::WikiLoopConfig) -> String 
 
 fn skills_empty_note(config: &crate::wiki_loop::config::WikiLoopConfig) -> String {
     format!(
-        "no skills found at {}; skills appear here after `memex wiki-loop apply`",
+        "no skills or proposals at {}; proposals staged by the loop appear here for \
+         review (a approve / d deny), applied skills below them",
         config.skills_root.display()
     )
 }
@@ -7104,6 +7276,9 @@ fn frontmatter_field(content: &str, key: &str) -> Option<String> {
 }
 
 fn build_browser_lines(entry: &WikiEntry) -> Vec<PreviewLine> {
+    if matches!(entry.kind, WikiEntryKind::Proposal) {
+        return build_proposal_lines(entry);
+    }
     let content = match std::fs::read_to_string(&entry.path) {
         Ok(content) => content,
         Err(err) => {
@@ -7120,6 +7295,66 @@ fn build_browser_lines(entry: &WikiEntry) -> Vec<PreviewLine> {
         && let Some(dir) = entry.path.parent()
         && let Ok(purpose) = std::fs::read_to_string(dir.join("PURPOSE.md"))
     {
+        lines.push(PreviewLine::Empty);
+        append_capped_markdown(&mut lines, &purpose);
+    }
+    lines
+}
+
+/// Proposal preview: a metadata header (id, status, scope, patterns, rationale),
+/// the staged SKILL.md, then its diff and PURPOSE.md — everything the a/d decision
+/// needs on one screen.
+fn build_proposal_lines(entry: &WikiEntry) -> Vec<PreviewLine> {
+    let mut lines = Vec::new();
+    // entry.path = <proposals_dir>/<id>/SKILL.md: its parent is the proposal's own
+    // directory, the grandparent the proposals root `Proposal::load` expects.
+    let Some(id) = entry.id.as_deref() else {
+        return vec![PreviewLine::Text(
+            "proposal entry carries no id or directory".to_string(),
+        )];
+    };
+    let Some(dir) = entry.path.parent().map(|p| p.to_path_buf()) else {
+        return vec![PreviewLine::Text(format!("proposal {id} has no directory"))];
+    };
+    let Some(proposals_root) = dir.parent() else {
+        return vec![PreviewLine::Text(format!(
+            "proposal {id} has no proposals root"
+        ))];
+    };
+    match crate::wiki_loop::gates::Proposal::load(proposals_root, id) {
+        Ok(proposal) => {
+            let meta = format!(
+                "proposal {}\nstatus: {} · scope: {}\npatterns: {}\n\nrationale: {}\n",
+                proposal.id,
+                proposal.status,
+                proposal.scope,
+                proposal.purpose_patterns.join(", "),
+                proposal.rationale
+            );
+            append_capped_markdown(&mut lines, &meta);
+        }
+        Err(err) => {
+            lines.push(PreviewLine::Text(format!(
+                "couldn't read proposal {id}: {err}"
+            )));
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(&entry.path) {
+        lines.push(PreviewLine::Empty);
+        append_capped_markdown(&mut lines, &content);
+    } else {
+        lines.push(PreviewLine::Text(format!(
+            "no staged SKILL.md at {}",
+            entry.path.display()
+        )));
+    }
+    if let Ok(diff) = std::fs::read_to_string(dir.join("skill.diff"))
+        && !diff.trim().is_empty()
+    {
+        lines.push(PreviewLine::Empty);
+        append_capped_markdown(&mut lines, &diff);
+    }
+    if let Ok(purpose) = std::fs::read_to_string(dir.join("PURPOSE.md")) {
         lines.push(PreviewLine::Empty);
         append_capped_markdown(&mut lines, &purpose);
     }
@@ -8530,6 +8765,10 @@ mod tests {
         let config = crate::wiki_loop::config::WikiLoopConfig {
             wiki_root: tmp.path().join("wiki"),
             skills_root: skills_root.clone(),
+            // The loader also reads the proposals ledger — pin it to the tempdir
+            // so the machine's real staged proposals never leak into the test.
+            state_db: tmp.path().join("state.db"),
+            proposals_dir: tmp.path().join("proposals"),
             ..Default::default()
         };
         let entries = load_skill_entries(&config);
@@ -8561,6 +8800,8 @@ mod tests {
             description: None,
             kind: WikiEntryKind::Pattern,
             path,
+            id: None,
+            status: None,
         };
 
         let lines = build_browser_lines(&entry);
@@ -8635,6 +8876,192 @@ mod tests {
         assert_eq!(app.layout_mode, LayoutMode::Split);
     }
 
+    /// A tempdir-backed wiki-loop config for proposal review tests — never the
+    /// machine's real ~/.memex paths.
+    fn review_config(tmp: &tempfile::TempDir) -> crate::wiki_loop::config::WikiLoopConfig {
+        crate::wiki_loop::config::WikiLoopConfig {
+            queue_dir: tmp.path().join("queue"),
+            state_db: tmp.path().join("state.db"),
+            wiki_root: tmp.path().join("wiki"),
+            skills_root: tmp.path().join("skills"),
+            proposals_dir: tmp.path().join("proposals"),
+            ..crate::wiki_loop::config::WikiLoopConfig::default()
+        }
+    }
+
+    /// Stage a proposal with passing Tier-0 gate stamps (apply refuses gateless
+    /// proposals) and mirror it into the ledger at `status`.
+    fn stage_review_proposal(
+        cfg: &crate::wiki_loop::config::WikiLoopConfig,
+        id: &str,
+        skill_name: &str,
+        status: &str,
+    ) {
+        use std::collections::BTreeMap;
+        let dir = cfg.proposals_dir.join(id);
+        std::fs::create_dir_all(&dir).expect("proposal dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {skill_name}\ndescription: staged for review\n---\n\n# {skill_name}\n"
+            ),
+        )
+        .expect("staged SKILL.md");
+        std::fs::write(dir.join("skill.diff"), "--- a\n+++ b\n").expect("staged skill.diff");
+        let mut gates: BTreeMap<String, crate::wiki_loop::gates::GateResult> = BTreeMap::new();
+        gates.insert(
+            "secret_scan".into(),
+            crate::wiki_loop::gates::GateResult {
+                passed: true,
+                detail: "no secrets detected".into(),
+            },
+        );
+        let proposal = crate::wiki_loop::gates::Proposal {
+            id: id.to_string(),
+            created_at: 0,
+            skill_name: skill_name.to_string(),
+            description: "staged for review".into(),
+            status: status.to_string(),
+            scope: "global".into(),
+            purpose_patterns: vec!["pat_test".into()],
+            rationale: "test rationale".into(),
+            gates,
+        };
+        proposal.save(&cfg.proposals_dir).expect("save proposal");
+        let ledger = crate::wiki_loop::ledger::StateLedger::open(&cfg.state_db).expect("ledger");
+        ledger.insert_proposal(id, skill_name, &[]).expect("insert");
+        ledger
+            .set_proposal_status(id, status, "{}")
+            .expect("status");
+    }
+
+    fn review_app(cfg: &crate::wiki_loop::config::WikiLoopConfig) -> (tempfile::TempDir, App) {
+        let (tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Skills;
+        app.skills.focus = Focus::List;
+        app.wiki_loop_config = Some(cfg.clone());
+        app.skills.entries = load_skill_entries(cfg);
+        app.skills.list.select(Some(0));
+        app.skills.update_content();
+        (tmp, app)
+    }
+
+    #[test]
+    fn skills_browser_lists_staged_proposals_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = review_config(&tmp);
+        stage_review_proposal(&cfg, "prop_t_1", "staged-skill", "validated");
+        let skill_dir = cfg.skills_root.join("live-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: already applied\n---\n\n# live-skill\n",
+        )
+        .expect("SKILL.md");
+
+        let entries = load_skill_entries(&cfg);
+        assert_eq!(entries.len(), 2, "one proposal + one applied skill");
+        assert_eq!(entries[0].kind, WikiEntryKind::Proposal);
+        assert_eq!(entries[0].title, "staged-skill");
+        assert_eq!(entries[0].id.as_deref(), Some("prop_t_1"));
+        assert_eq!(entries[0].status.as_deref(), Some("validated"));
+        assert_eq!(entries[1].kind, WikiEntryKind::Skill);
+        assert_eq!(entries[1].title, "live-skill");
+
+        // The preview carries the proposal metadata, not just the SKILL.md body.
+        let lines = build_browser_lines(&entries[0]);
+        let text: String = lines
+            .iter()
+            .map(|line| match line {
+                PreviewLine::Text(text) => format!("{text}\n"),
+                PreviewLine::Styled { spans, .. } => spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(text.contains("prop_t_1"), "{text}");
+        assert!(text.contains("validated"), "{text}");
+        assert!(text.contains("test rationale"), "{text}");
+    }
+
+    #[test]
+    fn skills_approve_key_applies_validated_proposal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = review_config(&tmp);
+        stage_review_proposal(&cfg, "prop_t_2", "approve-skill", "validated");
+        let (_app_tmp, mut app) = review_app(&cfg);
+
+        let approve = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+        handle_skills_key(approve, &mut app).expect("approve key");
+
+        let deployed = cfg.skills_root.join("approve-skill/SKILL.md");
+        assert!(deployed.exists(), "skill must be applied");
+        assert!(app.status.contains("applied"), "{}", app.status);
+        // The refreshed list replaced the proposal row with the applied skill.
+        assert!(
+            !app.skills
+                .entries
+                .iter()
+                .any(|entry| entry.kind == WikiEntryKind::Proposal),
+            "proposal must leave the review queue"
+        );
+        assert!(
+            app.skills
+                .entries
+                .iter()
+                .any(|entry| entry.title == "approve-skill" && entry.kind == WikiEntryKind::Skill),
+            "applied skill must be listed"
+        );
+        let ledger = crate::wiki_loop::ledger::StateLedger::open(&cfg.state_db).expect("ledger");
+        assert!(ledger.staged_proposals(10).expect("staged").is_empty());
+    }
+
+    #[test]
+    fn skills_approve_key_requires_validated_proposal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = review_config(&tmp);
+        stage_review_proposal(&cfg, "prop_t_3", "pending-skill", "pending");
+        let (_app_tmp, mut app) = review_app(&cfg);
+
+        let approve = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
+        handle_skills_key(approve, &mut app).expect("approve key");
+
+        assert!(
+            !cfg.skills_root.join("pending-skill/SKILL.md").exists(),
+            "pending proposals must not be appliable"
+        );
+        assert!(app.status.contains("pending"), "{}", app.status);
+    }
+
+    #[test]
+    fn skills_deny_key_rejects_staged_proposal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = review_config(&tmp);
+        stage_review_proposal(&cfg, "prop_t_4", "deny-skill", "validated");
+        let (_app_tmp, mut app) = review_app(&cfg);
+
+        let deny = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty());
+        handle_skills_key(deny, &mut app).expect("deny key");
+
+        assert!(app.status.contains("denied"), "{}", app.status);
+        assert!(
+            !cfg.skills_root.join("deny-skill/SKILL.md").exists(),
+            "deny must not deploy anything"
+        );
+        assert!(
+            !app.skills
+                .entries
+                .iter()
+                .any(|entry| entry.kind == WikiEntryKind::Proposal),
+            "denied proposal must leave the review queue"
+        );
+        let saved = crate::wiki_loop::gates::Proposal::load(&cfg.proposals_dir, "prop_t_4")
+            .expect("reload");
+        assert_eq!(saved.status, "rejected");
+    }
+
     #[test]
     fn wiki_panels_render_entries_and_content() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -8653,6 +9080,8 @@ mod tests {
             description: None,
             kind: WikiEntryKind::Pattern,
             path,
+            id: None,
+            status: None,
         }];
         app.wiki.list.select(Some(0));
         app.wiki.update_content();
@@ -8705,6 +9134,8 @@ mod tests {
             description: Some("tunes slow queries".to_string()),
             kind: WikiEntryKind::Skill,
             path: skill_dir.join("SKILL.md"),
+            id: None,
+            status: None,
         }];
         app.skills.list.select(Some(0));
         app.skills.update_content();

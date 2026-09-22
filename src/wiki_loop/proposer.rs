@@ -36,9 +36,11 @@ struct ExistingSkillSummary {
 }
 
 pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -> Result<String> {
-    // Weekly proposal ceiling: approval fatigue defeats the human gate.
+    // Weekly proposal ceiling: approval fatigue defeats the human gate. Only
+    // reviewable proposals (not gate-rejected ones) spend it — see the ledger.
     if !dry_run
-        && ledger.proposals_since(now_ms() - 7 * 24 * 3_600_000)? >= cfg.max_proposals_per_week
+        && ledger.reviewable_proposals_since(now_ms() - 7 * 24 * 3_600_000)?
+            >= cfg.max_proposals_per_week
     {
         return Ok(format!(
             "proposal ceiling reached (≥ {}/week); proposer quiet until next week",

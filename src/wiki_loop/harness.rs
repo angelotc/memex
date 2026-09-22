@@ -225,6 +225,15 @@ fn unwrap_envelope(v: Value) -> Result<Value> {
     // `response` (agy) field. Models often pad it with prose before a fenced block, so
     // probe any answer field that contains an object and fall back to the envelope
     // itself when there is nothing parseable inside.
+    // `structured_output` is probed first: when the harness enforced the JSON schema
+    // (`RoleConfig::json_schema`), that field carries the schema-valid object even
+    // while the textual `response` drifts into prose — the observed failure mode is
+    // exactly that pair, and scraping prose would throw the compliant answer away.
+    if let Some(inner) = v.get("structured_output")
+        && inner.is_object()
+    {
+        return Ok(inner.clone());
+    }
     for key in ["result", "response"] {
         if let Some(text) = v.get(key).and_then(Value::as_str)
             && text.contains('{')
@@ -362,6 +371,39 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("no JSON"), "{msg}");
         assert!(msg.contains("MAX_TURNS"), "{msg}");
+    }
+
+    #[test]
+    fn envelope_structured_object_beats_prose_response() {
+        // The live breaker-tripper (runs #397-399): agy enforced the schema into
+        // `structured_output` while `response` drifted into brace-free prose.
+        // The schema-valid object must win over prose scraping.
+        let script = format!(
+            "cat > /dev/null; printf '%s' '{drift}'",
+            drift = r#"{"conversation_id":"abc","status":"SUCCESS","response":"I shall describe these patterns in prose instead.","structured_output":{"patterns":[]},"json_schema":true,"usage":{}}"#
+        );
+        let r = role(&["sh", "-c", &script]);
+        let v =
+            run_role_structured(&r, "prompt", None, Duration::from_secs(30)).expect("structured");
+        assert!(v.get("patterns").is_some(), "{v}");
+        assert!(
+            v.get("conversation_id").is_none(),
+            "must not leak the envelope"
+        );
+    }
+
+    #[test]
+    fn envelope_structured_null_still_fails_like_drift() {
+        // A null structured_output (model never complied) keeps the old error path.
+        let script = format!(
+            "cat > /dev/null; printf '%s' '{drift}'",
+            drift = r#"{"conversation_id":"abc","status":"SUCCESS","response":"prose only","structured_output":null}"#
+        );
+        let r = role(&["sh", "-c", &script]);
+        let err =
+            run_role_structured(&r, "prompt", None, Duration::from_secs(30)).expect_err("fails");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("carried no JSON"), "{msg}");
     }
 
     #[test]

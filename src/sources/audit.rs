@@ -95,6 +95,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
     push(
+        SourceKind::Kiro,
+        super::kiro::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
+    push(
         SourceKind::Muse,
         super::muse::discover(None)
             .into_iter()
@@ -109,6 +116,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
     push(SourceKind::Bob, super::bob::usage_files());
+    push(SourceKind::Zcode, super::zcode::usage_files());
 
     push(
         SourceKind::Omp,
@@ -138,10 +146,14 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
         ..SourceAudit::default()
     };
     for file in files {
-        if matches!(source, SourceKind::Hermes | SourceKind::Bob) {
-            // Hermes usage truth and Bob tasks are SQLite data. Audit must not
-            // reinterpret the database as JSON, and in particular must not
-            // read transcript/message columns: count the file, skip content.
+        if matches!(
+            source,
+            SourceKind::Hermes | SourceKind::Bob | SourceKind::Zcode
+        ) {
+            // Hermes usage truth, Bob tasks, and Zcode sessions are SQLite data.
+            // Audit must not reinterpret the database as JSON, and in particular
+            // must not read transcript/message columns: count the file, skip
+            // content.
             continue;
         }
         if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(file) {
@@ -317,6 +329,11 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         // Jcode files are audited whole-document in `audit_jcode_file` and never
         // reach the per-line path.
         SourceKind::Jcode => {}
+        SourceKind::Kiro => {
+            if let Some(kind) = value.pointer("/payload/type").and_then(Value::as_str) {
+                increment(&mut audit.semantic_types, kind);
+            }
+        }
         SourceKind::Muse => {
             if let Some(payload) = value.get("payload").and_then(Value::as_object) {
                 let kind = payload
@@ -356,6 +373,8 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         }
         // Bob never reaches here: it contributes no files to the audit.
         SourceKind::Bob => {}
+        // Zcode sessions are SQLite rows, not per-line JSON documents.
+        SourceKind::Zcode => {}
     }
 }
 

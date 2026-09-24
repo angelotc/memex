@@ -4,7 +4,7 @@ use crate::types::{
     Record, SourceFilter, SourceKind, jcode_text_is_subagent_directive,
     jcode_tmp_cwd_is_worker_sandbox,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -74,7 +74,7 @@ impl SessionKindFilter {
 }
 
 /// A session row with every stored column, for `memex sessions`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionDetailRow {
     pub source: SourceKind,
     pub session_id: String,
@@ -1143,7 +1143,17 @@ impl AnalyticsWriter {
                 ..SessionMetadata::default()
             };
         };
-        let git = GitMetadata::from(self.repositories.resolve(Path::new(&cwd)));
+        let mut git = GitMetadata::from(self.repositories.resolve(Path::new(&cwd)));
+        if key.source == SourceKind::Kiro && git.repo_project.is_none() && !Path::new(&cwd).exists()
+        {
+            git.repo_project = Path::new(&cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            if git.repo_project.is_some() {
+                git.status = "path-fallback".to_string();
+            }
+        }
         SessionMetadata {
             cwd: Some(cwd),
             git_root: git.git_root,
@@ -1194,11 +1204,27 @@ pub(crate) struct PreparedAnalytics<'a> {
 
 impl PreparedAnalytics<'_> {
     pub(crate) fn commit(self, delete_paths: &[String], scopes: &[SessionScope]) -> Result<()> {
+        self.commit_inner(delete_paths, scopes, false)
+    }
+
+    fn replace_all_and_mark_complete(self) -> Result<()> {
+        self.commit_inner(&[], &[], true)
+    }
+
+    fn commit_inner(
+        self,
+        delete_paths: &[String],
+        scopes: &[SessionScope],
+        replace_all: bool,
+    ) -> Result<()> {
         crate::profiling::span!("analytics.persist");
-        if self.rows.is_empty() && delete_paths.is_empty() && scopes.is_empty() {
+        if self.rows.is_empty() && delete_paths.is_empty() && scopes.is_empty() && !replace_all {
             return Ok(());
         }
         let tx = self.writer.store.conn.transaction()?;
+        if replace_all {
+            tx.execute("DELETE FROM sessions", [])?;
+        }
         for scope in scopes {
             delete_scope(&tx, scope)?;
         }
@@ -1254,6 +1280,13 @@ impl PreparedAnalytics<'_> {
                     conversation_kind,
                 ])?;
             }
+        }
+        if replace_all {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES('analytics_complete', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
         }
         tx.commit()?;
         self.writer.sessions.clear();
@@ -1415,6 +1448,9 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd.to_string_lossy().to_string());
     }
+    if source == SourceKind::Kiro {
+        return crate::sources::kiro::session_cwd(Path::new(source_path));
+    }
     if source == SourceKind::Muse
         && let Some(cwd) = crate::sources::muse::cwd_from_muse_session(Path::new(source_path))
     {
@@ -1429,6 +1465,11 @@ fn resolve_session_cwd_from_parts(
         // Virtual `<db>/<task_id>` paths cannot be opened as transcripts.
         return crate::sources::bob::session_cwd(Path::new(source_path))
             .map(|cwd| cwd.to_string_lossy().to_string());
+    }
+    if source == SourceKind::Zcode
+        && let Some(cwd) = crate::sources::zcode::session_cwd(Path::new(source_path), session_id)
+    {
+        return Some(cwd.to_string_lossy().to_string());
     }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
@@ -2105,6 +2146,15 @@ fn extract_session_label(
                 first_user_text?.to_string()
             }
         }
+        SourceKind::Zcode => {
+            if let Some(title) =
+                crate::sources::zcode::session_title(Path::new(source_path), session_id)
+            {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
         _ => first_user_text?.to_string(),
     };
     let label = sanitize_label(&raw);
@@ -2184,12 +2234,10 @@ pub fn rebuild_from_records(
     records: impl IntoIterator<Item = Record>,
 ) -> Result<()> {
     let mut writer = AnalyticsWriter::open(path)?;
-    writer.clear()?;
     for record in records {
         writer.record(&record)?;
     }
-    writer.flush()?;
-    writer.store.mark_complete()
+    writer.prepare().replace_all_and_mark_complete()
 }
 
 pub fn backfill_from_index(
@@ -2204,16 +2252,22 @@ pub(crate) fn backfill_from_index_with_repositories(
     index: &crate::index::SearchIndex,
     repositories: Arc<RepositoryResolver>,
 ) -> Result<()> {
+    let expected_records = index.doc_count()?;
+    let mut scanned_records = 0usize;
     let mut writer = AnalyticsWriter::with_repositories(path, repositories)?;
-    writer.clear()?;
     index
         .for_each_record(|record| {
+            scanned_records += 1;
             writer.record(&record)?;
             Ok(())
         })
         .context("read records for analytics backfill")?;
-    writer.flush()?;
-    writer.store.mark_complete()
+    if scanned_records != expected_records {
+        bail!(
+            "analytics backfill read {scanned_records} of {expected_records} indexed records; keeping the existing analytics cache"
+        );
+    }
+    writer.prepare().replace_all_and_mark_complete()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2528,6 +2582,78 @@ mod tests {
     }
 
     #[test]
+    fn replacement_keeps_previous_session_visible_until_flush() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write transcript");
+        let db = tmp.path().join("analytics.sqlite");
+        let source_path = transcript.to_string_lossy().to_string();
+
+        let mut initial = AnalyticsWriter::open(&db).expect("open initial analytics");
+        initial
+            .record(&record("memex", "s1", &transcript, 10))
+            .expect("record initial session");
+        initial.flush().expect("flush initial session");
+
+        let mut replacement = AnalyticsWriter::open(&db).expect("open replacement analytics");
+        replacement
+            .record(&record("memex", "s1", &transcript, 20))
+            .expect("record replacement session");
+
+        let before_flush = AnalyticsStore::open_read_only(&db).expect("open existing catalog");
+        let rows = before_flush
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query existing catalog");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_at, 10);
+        drop(before_flush);
+
+        replacement
+            .prepare()
+            .commit(&[source_path], &[])
+            .expect("flush replacement");
+        let after_flush = AnalyticsStore::open_read_only(&db).expect("open replaced catalog");
+        let rows = after_flush
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query replaced catalog");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_at, 20);
+        assert_eq!(rows[0].message_count, 1);
+    }
+
+    #[test]
+    fn failed_rebuild_preserves_previous_complete_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("session.jsonl");
+        rebuild_from_records(&db, [record("memex", "old", &transcript, 10)]).unwrap();
+        let store = AnalyticsStore::open(&db).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_new_session BEFORE INSERT ON sessions
+             WHEN NEW.session_id = 'new'
+             BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
+            )
+            .unwrap();
+        assert!(rebuild_from_records(&db, [record("memex", "new", &transcript, 20)]).is_err());
+        assert!(store.complete().unwrap());
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "old");
+        assert_eq!(rows[0].message_count, 1);
+    }
+
+    #[test]
     fn detailed_sessions_filter_by_cwd_prefix() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -2734,6 +2860,80 @@ mod tests {
         assert!(
             plan.contains("sessions_repository_project_last_at_idx"),
             "{plan}"
+        );
+    }
+
+    #[test]
+    fn kiro_repository_grouping_uses_archived_workspace_but_prefers_local_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repository");
+        fs::create_dir_all(repo.join("nested")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let standalone = tmp.path().join("standalone");
+        fs::create_dir(&standalone).unwrap();
+        let mut records = Vec::new();
+        for (id, cwd) in [
+            (
+                "archived",
+                Some(tmp.path().join("missing/archived-project")),
+            ),
+            ("local", Some(repo.join("nested"))),
+            ("non-git", Some(standalone)),
+            ("no-metadata", None),
+        ] {
+            let dir = tmp.path().join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let transcript = dir.join("messages.jsonl");
+            if let Some(cwd) = cwd {
+                fs::write(
+                    dir.join("session.json"),
+                    serde_json::json!({"workspacePaths":[cwd]}).to_string(),
+                )
+                .unwrap();
+            }
+            let mut row = record("raw", id, &transcript, 10);
+            row.source = SourceKind::Kiro;
+            records.push(row);
+        }
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(&db, records).unwrap();
+        let store = AnalyticsStore::open(&db).unwrap();
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Repository, None)
+            .unwrap();
+        for (id, expected) in [
+            ("archived", "archived-project"),
+            ("local", "repository"),
+            ("non-git", UNFILED_PROJECT),
+            ("no-metadata", UNFILED_PROJECT),
+        ] {
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.session_id == id)
+                    .unwrap()
+                    .display_project,
+                expected
+            );
+        }
+        assert_eq!(
+            store
+                .query_sessions(
+                    None,
+                    None,
+                    Some("archived-project"),
+                    ProjectGrouping::Repository,
+                    None
+                )
+                .unwrap()
+                .len(),
+            1
         );
     }
 

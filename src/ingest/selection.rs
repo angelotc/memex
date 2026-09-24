@@ -33,6 +33,8 @@ enum Shape {
     Muse,
     Antigravity,
     Bob,
+    Zcode,
+    Kiro,
 }
 
 struct Root {
@@ -117,6 +119,9 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
     if options.include_jcode {
         roots.push(Root::new(sources::jcode::sessions_root(), Shape::Jcode));
     }
+    if options.include_kiro {
+        roots.push(Root::new(sources::kiro::sessions_root(), Shape::Kiro));
+    }
     if options.include_muse {
         roots.push(Root::new(sources::muse::sessions_root(), Shape::Muse));
     }
@@ -131,6 +136,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
             sources::bob::roots()
                 .into_iter()
                 .map(|root| Root::new(root, Shape::Bob)),
+        );
+    }
+    if options.include_zcode {
+        roots.extend(
+            sources::zcode::db_dirs()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Zcode)),
         );
     }
     roots
@@ -221,11 +233,21 @@ fn classify(root: &Root, path: &Path) -> Match {
             (name.starts_with("session_") && name.ends_with(".json")).then_some(SourceKind::Jcode)
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
+        Shape::Kiro => (parts.len() == 3 && name == "messages.jsonl").then_some(SourceKind::Kiro),
         Shape::Bob => {
             // Every task shares one database and discovery diffs task aggregates
             // itself, so a commit targets the database (`resolve` already routed WAL
             // and journal hints to it). The shared-memory index is read noise.
             return if parts.len() == 1 && sources::bob::is_configured_database(path) {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
+        Shape::Zcode => {
+            // One store per db directory; `resolve` routes WAL and shared-memory
+            // sidecar hints to the database before classification.
+            return if parts.len() == 1 && name == "db.sqlite" {
                 Match::Database(path.to_path_buf())
             } else {
                 Match::Ignore
@@ -270,9 +292,20 @@ fn resolve(
         let mut matches = Vec::new();
         let mut known_unmatched = false;
         for root in roots {
-            let Some(path) = root.remap(hint) else {
+            let Some(mut path) = root.remap(hint) else {
                 continue;
             };
+            if matches!(root.shape, Shape::Kiro)
+                && path
+                    .strip_prefix(&root.lexical)
+                    .is_ok_and(|p| p.components().count() == 3)
+                && path.file_name().is_some_and(|n| n == "session.json")
+            {
+                path.set_file_name("messages.jsonl");
+                if !path.exists() && !state.contains_file(path.to_string_lossy().as_ref())? {
+                    continue;
+                }
+            }
             if excluder.is_excluded(&path) || excluder.is_excluded(hint) {
                 continue;
             }
@@ -295,6 +328,16 @@ fn resolve(
                     })
                     .map(|name| path.with_file_name(name))
                     .filter(|database| sources::bob::is_configured_database(database))
+                    .unwrap_or(path),
+                Shape::Zcode => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-shm"))
+                    })
+                    .filter(|name| *name == "db.sqlite")
+                    .map(|name| path.with_file_name(name))
                     .unwrap_or(path),
                 _ => path,
             };
@@ -353,6 +396,8 @@ fn resolve(
                     }
                     let source = if sources::bob::is_configured_database(&path) {
                         SourceKind::Bob
+                    } else if matches!(root.shape, Shape::Zcode) {
+                        SourceKind::Zcode
                     } else {
                         SourceKind::Opencode
                     };
@@ -468,6 +513,8 @@ mod tests {
             include_muse: false,
             include_antigravity: false,
             include_bob: false,
+            include_zcode: false,
+            include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -655,6 +702,8 @@ mod tests {
             (Shape::Grok, "a/b/c/updates.jsonl"),
             (Shape::Jcode, "notes.json"),
             (Shape::Muse, "notes.jsonl"),
+            (Shape::Kiro, "project/id/snapshots/messages.jsonl"),
+            (Shape::Kiro, "project/id/session.json"),
             (Shape::Opencode, "nested/opencode.db"),
             (Shape::Opencode, "other.db-wal"),
             (Shape::CodexHome, "settings.json"),

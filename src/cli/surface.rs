@@ -183,6 +183,8 @@ pub(super) enum IndexSource {
     Muse,
     Antigravity,
     Bob,
+    Zcode,
+    Kiro,
 }
 
 impl IndexArgs {
@@ -201,6 +203,8 @@ impl IndexArgs {
             IndexSource::Muse => self.muse && !self.no_muse,
             IndexSource::Antigravity => self.antigravity && !self.no_antigravity,
             IndexSource::Bob => self.bob && !self.no_bob,
+            IndexSource::Zcode => self.zcode && !self.no_zcode,
+            IndexSource::Kiro => self.kiro && !self.no_kiro,
         };
         legacy_enabled
             && (self.only_source.is_empty() || self.only_source.contains(&source))
@@ -448,6 +452,8 @@ mod tests {
             "--no-muse",
             "--no-antigravity",
             "--no-bob",
+            "--no-zcode",
+            "--no-kiro",
         ]);
         assert_eq!(
             selected.source.as_deref(),

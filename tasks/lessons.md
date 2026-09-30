@@ -33,3 +33,8 @@
 - glibc arena blowout in bfd: `MALLOC_ARENA_MAX=1` cut the lib-test link from
   OOM-kill territory to fitting comfortably. Use it for every link-heavy cargo
   invocation on this box.
+- USER REMINDER (2026-09-22): repeated VM crashes make build safety a hard
+  verification precondition. Before every cargo build/test/clippy: verify jobs=2,
+  no competing cargo/linker or live proposer, and >=4 GB MemAvailable; use one
+  process-group watchdog (1800 MB floor), MALLOC_ARENA_MAX=1, and
+  CARGO_PROFILE_TEST_DEBUG=0. Do not clear caches or start parallel build commands.

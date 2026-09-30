@@ -2,9 +2,9 @@
 //!
 //! Tier 0 — static hygiene: secret rescan, slug check, dedup, recently-rejected check,
 //! referenced-path existence, scope stamp. Zero LLM cost.
-//! Tier 1 — counterfactual LLM judge over K historical sessions that hit the failure mode
-//! (the production adaptation of the paper's validation rollouts; repo tests cannot grade
-//! an instruction change).
+//! Tier 1 — counterfactual LLM judge over up to K complete historical sessions, including
+//! failing and passing evidence when present (the production adaptation of the paper's
+//! validation rollouts; repo tests cannot grade an instruction change).
 //!
 //! The wiki is **never** modified here. Only skill deployment, the ledger, and the
 //! `skill-impact.md` audit trail (paper: appended programmatically after every decision).
@@ -379,12 +379,10 @@ fn repo_root_for_project(cfg: &WikiLoopConfig, project: &str) -> Result<Option<P
 static MARKDOWN_CODE: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new("`([^`\\n]+)`").expect("static regex"));
 
-/// The sessions the tier-1 judge replays: the corroborating (failure-mode) sessions
-/// stamped on the patterns that motivated the proposal come first — the judge's
-/// contract is "historical sessions that hit the failure mode" (prompts/judge.md) —
-/// then the most recent sessions of the relevant project(s) top the set up to
-/// `budget`. Recency alone puts mostly unrelated work in front of the judge, which
-/// fails global proposals by arithmetic rather than by judgment.
+/// Candidate sessions for the Tier-1 judge: corroborating sessions stamped on the
+/// proposal's motivating patterns come first, then recent sessions from the relevant
+/// project(s) top the candidate pool. The caller classifies complete records as failing or
+/// passing evidence before judging.
 fn replay_sessions(
     analytics_db: &Path,
     catalog: &BTreeMap<String, (PathBuf, super::patterns::PatternMeta)>,
@@ -450,9 +448,76 @@ fn replay_sessions(
     Ok(sessions)
 }
 
-/// Tier 1 — counterfactual LLM judge over historical sessions that hit the failure
-/// mode (see [`replay_sessions`]). A proposal with neither corroborating sessions nor
-/// resolvable project history fails closed: it would otherwise skip both real gates.
+struct Tier1Evidence {
+    digest: String,
+    session_ids: Vec<String>,
+}
+
+/// Load and classify complete traces before they reach the judge. Any missing or partial
+/// replay session is an error: silently dropping it could turn an unavailable sample into
+/// a passing verdict. The original half-batch byte budget applies to the combined digest.
+fn collect_tier1_evidence<F>(
+    cfg: &WikiLoopConfig,
+    sessions: &[ingest::SessionMeta],
+    mut load: F,
+) -> Result<Tier1Evidence>
+where
+    F: FnMut(&ingest::SessionMeta) -> Result<Vec<crate::types::Record>>,
+{
+    let byte_budget = cfg.max_chars_per_batch / 2;
+    let mut digest = String::new();
+    let mut session_ids = Vec::new();
+
+    for meta in sessions.iter().take(cfg.tier1_sessions) {
+        let records = load(meta).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot load Tier-1 evidence for session {}:{}: {e:#}",
+                meta.source,
+                meta.session_id
+            )
+        })?;
+        if records.is_empty() || !ingest::records_complete(&records, meta) {
+            bail!(
+                "incomplete Tier-1 evidence for session {}:{} (loaded {} of {} records)",
+                meta.source,
+                meta.session_id,
+                records.len(),
+                meta.message_count
+            );
+        }
+
+        let indices = super::digest::extract_error_turn_indices(&records);
+        let (header, summary) = if !indices.is_empty() {
+            (
+                "## Failing Session (root-cause evidence)\n\n",
+                super::digest::build_session_summary(cfg, meta, &records, &indices),
+            )
+        } else {
+            (
+                "## Passing Session (successful-strategy evidence)\n\n",
+                super::digest::build_success_summary(cfg, meta, &records),
+            )
+        };
+        if !digest.is_empty() {
+            digest.push_str("\n\n---\n\n");
+        }
+        digest.push_str(header);
+        digest.push_str(&summary);
+        session_ids.push(meta.session_id.clone());
+        if digest.len() > byte_budget {
+            break;
+        }
+    }
+
+    Ok(Tier1Evidence {
+        digest,
+        session_ids,
+    })
+}
+
+/// Tier 1 — counterfactual LLM judge over historical failure and success evidence
+/// (see [`replay_sessions`]). A proposal without complete usable evidence fails
+/// closed rather than treating an unrun judge as a pass.
 pub fn tier1(
     cfg: &WikiLoopConfig,
     proposal: &Proposal,
@@ -497,31 +562,13 @@ pub fn tier1(
     }
 
     let index_dir = cfg.index_dir()?;
-    let mut digest = String::new();
-    let mut used = 0usize;
-    let mut digested_ids: Vec<String> = Vec::new();
-    for meta in &sessions {
-        let records = match ingest::load_records(&index_dir, meta) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let indices = super::digest::extract_error_turn_indices(&records);
-        if indices.is_empty() {
-            continue;
-        }
-        let summary = super::digest::build_session_summary(cfg, meta, &records, &indices);
-        digest.push_str(&summary);
-        digest.push_str("\n\n---\n\n");
-        digested_ids.push(meta.session_id.clone());
-        used += 1;
-        if used >= cfg.tier1_sessions || digest.len() > cfg.max_chars_per_batch / 2 {
-            break;
-        }
-    }
-    if used == 0 {
+    let evidence = collect_tier1_evidence(cfg, &sessions, |meta| {
+        ingest::load_records(&index_dir, meta)
+    })?;
+    if evidence.session_ids.is_empty() {
         return Ok(Some(GateResult {
-            passed: true,
-            detail: "no historical error turns available to judge against; skipped".into(),
+            passed: false,
+            detail: "no complete historical failure or success evidence available to judge".into(),
         }));
     }
 
@@ -529,7 +576,7 @@ pub fn tier1(
         "{}\n\n## Candidate Skill\n\n```markdown\n{}\n```\n\n## Historical Sessions\n\n{}",
         super::prompts::JUDGE,
         skill_markdown,
-        digest
+        evidence.digest
     );
     let schema = if cfg.judge.json_schema {
         Some(cfg.schema_path("judge", super::prompts::JUDGE_SCHEMA)?)
@@ -549,7 +596,7 @@ pub fn tier1(
     {
         bail!("judge output missing `assessments`");
     }
-    Ok(Some(judge_verdict(&value, &digested_ids)))
+    Ok(Some(judge_verdict(&value, &evidence.session_ids)))
 }
 
 /// Tally the judge's per-session assessments against the sessions that were actually
@@ -933,6 +980,47 @@ mod tests {
             // Default roots are the real harness dirs — tests must never link there.
             harness_skill_roots: Vec::new(),
             ..WikiLoopConfig::default()
+        }
+    }
+
+    fn tier1_meta(session_id: &str, message_count: i64) -> ingest::SessionMeta {
+        ingest::SessionMeta {
+            source: "claude".into(),
+            session_id: session_id.into(),
+            source_path: None,
+            project: Some("p".into()),
+            cwd: Some("/app".into()),
+            git_root: None,
+            repo_project: Some("p".into()),
+            started_at: 0,
+            last_at: 0,
+            message_count,
+            resolution_status: Some("done".into()),
+        }
+    }
+
+    fn tier1_record(session_id: &str, tool_error: bool) -> crate::types::Record {
+        crate::types::Record {
+            source: crate::types::SourceKind::Claude,
+            doc_id: 1,
+            ts: 1,
+            project: "p".into(),
+            session_id: session_id.into(),
+            turn_id: 1,
+            role: if tool_error { "tool" } else { "user" }.into(),
+            text: if tool_error {
+                String::new()
+            } else {
+                "complete the task".into()
+            },
+            tool_name: tool_error.then(|| "bash".into()),
+            tool_input: tool_error.then(|| "run command".into()),
+            tool_output: tool_error.then(|| "Error: command failed".into()),
+            links: crate::types::RecordLinks {
+                tool_result_is_error: tool_error.then_some(true),
+                ..Default::default()
+            },
+            source_path: "/tmp/session.jsonl".into(),
         }
     }
 
@@ -1500,6 +1588,139 @@ mod tests {
             result.detail.contains("no contributing project patterns"),
             "{}",
             result.detail
+        );
+    }
+
+    #[test]
+    fn tier1_zero_configured_sessions_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_cfg(&tmp);
+        cfg.tier1_sessions = 0;
+        let proposal = Proposal {
+            id: "prop_zero_budget".into(),
+            created_at: now_ms(),
+            skill_name: "zero-budget-skill".into(),
+            description: "d".into(),
+            status: "pending".into(),
+            scope: "global".into(),
+            purpose_patterns: vec![],
+            rationale: "r".into(),
+            gates: Default::default(),
+        };
+
+        let result = tier1(&cfg, &proposal, "# skill\n", &[])
+            .expect("tier1 runs")
+            .expect("Some");
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn tier1_evidence_includes_passing_traces_and_keeps_strict_majority() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+        let sessions = vec![
+            tier1_meta("failed", 1),
+            tier1_meta("passed_a", 1),
+            tier1_meta("passed_b", 1),
+        ];
+        let evidence = collect_tier1_evidence(&cfg, &sessions, |meta| {
+            Ok(vec![tier1_record(
+                &meta.session_id,
+                meta.session_id == "failed",
+            )])
+        })
+        .expect("complete evidence");
+
+        assert_eq!(evidence.session_ids, vec!["failed", "passed_a", "passed_b"]);
+        assert!(evidence.digest.contains("Failing Session"));
+        assert!(evidence.digest.contains("Passing Session"));
+        assert!(evidence.digest.contains("Session `passed_a`"));
+
+        let verdict = judge_verdict(
+            &serde_json::json!({"assessments": [
+                {"session_id": "failed", "would_improve": true},
+                {"session_id": "passed_a", "would_improve": false},
+                {"session_id": "passed_b", "would_improve": false}
+            ]}),
+            &evidence.session_ids,
+        );
+        assert!(!verdict.passed, "one of three must not pass the gate");
+    }
+
+    #[test]
+    fn tier1_success_only_sample_reaches_judge_evidence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+        let session = tier1_meta("success_only", 1);
+        let evidence = collect_tier1_evidence(&cfg, &[session], |meta| {
+            Ok(vec![tier1_record(&meta.session_id, false)])
+        })
+        .expect("complete evidence");
+
+        assert_eq!(evidence.session_ids, vec!["success_only"]);
+        assert!(evidence.digest.contains("Passing Session"));
+        assert!(evidence.digest.contains("Session `success_only`"));
+        let verdict = judge_verdict(
+            &serde_json::json!({"assessments": [
+                {"session_id": "success_only", "would_improve": true}
+            ]}),
+            &evidence.session_ids,
+        );
+        assert!(verdict.passed, "the supplied passing trace is judgeable");
+    }
+
+    #[test]
+    fn tier1_evidence_respects_session_and_byte_budgets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_cfg(&tmp);
+        cfg.tier1_sessions = 1;
+        let sessions = vec![tier1_meta("included", 1), tier1_meta("over_cap", 1)];
+        let capped = collect_tier1_evidence(&cfg, &sessions, |meta| {
+            Ok(vec![tier1_record(&meta.session_id, false)])
+        })
+        .expect("complete evidence");
+        assert_eq!(capped.session_ids, vec!["included"]);
+        assert!(!capped.digest.contains("over_cap"));
+
+        cfg.tier1_sessions = 2;
+        cfg.max_chars_per_batch = 2;
+        let evidence = collect_tier1_evidence(&cfg, &sessions, |meta| {
+            Ok(vec![tier1_record(&meta.session_id, false)])
+        })
+        .expect("complete evidence");
+
+        assert_eq!(evidence.session_ids, vec!["included"]);
+        assert!(evidence.digest.contains("Session `included`"));
+        assert!(!evidence.digest.contains("over_cap"));
+    }
+
+    #[test]
+    fn tier1_incomplete_or_unreadable_replay_evidence_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+        let session = tier1_meta("partial", 2);
+
+        let partial = collect_tier1_evidence(&cfg, std::slice::from_ref(&session), |_| {
+            Ok(vec![tier1_record("partial", false)])
+        });
+        assert!(
+            partial.is_err(),
+            "partial records must not be treated as success"
+        );
+
+        let unreadable = collect_tier1_evidence(&cfg, std::slice::from_ref(&session), |_| {
+            anyhow::bail!("fixture read failure")
+        });
+        assert!(
+            unreadable.is_err(),
+            "load failures must not be silently skipped"
+        );
+
+        let empty_session = tier1_meta("empty_zero_count", 0);
+        let empty = collect_tier1_evidence(&cfg, &[empty_session], |_| Ok(Vec::new()));
+        assert!(
+            empty.is_err(),
+            "empty records are incomplete even at count zero"
         );
     }
 

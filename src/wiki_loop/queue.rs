@@ -6,8 +6,9 @@
 //! partial traces. Acknowledgement deletes an entry only if it was not updated while the
 //! maintainer was running.
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -74,6 +75,29 @@ impl QueueManager {
         ))
     }
 
+    fn dead_letter_path(&self, source: &str, session_id: &str) -> PathBuf {
+        self.dlq_dir.join(
+            self.entry_path(source, session_id)
+                .file_name()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Serialize upserts with DLQ recovery so a concurrent enqueue cannot be
+    /// overwritten by the older dead-letter snapshot.
+    fn lock_queue(&self) -> Result<File> {
+        let lock_path = self.queue_dir.join(".queue.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open queue lock {}", lock_path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock queue {}", self.queue_dir.display()))?;
+        Ok(file)
+    }
+
     /// Whether a session has a dead-letter entry. The collector sweep consults this so
     /// a poison session stays parked in the DLQ instead of being re-enqueued with a
     /// fresh retry counter every cycle — the DLQ is the terminal, human-visible signal.
@@ -111,6 +135,7 @@ impl QueueManager {
         ended: bool,
         last_event_at: i64,
     ) -> Result<PathBuf> {
+        let _queue_lock = self.lock_queue()?;
         let path = self.entry_path(source, session_id);
         let existing: Option<QueueEntry> = self.read_entry(&path);
 
@@ -141,6 +166,72 @@ impl QueueManager {
         }
         self.write_atomic(&path, &entry)?;
         Ok(path)
+    }
+
+    /// List readable dead letters in stable source/session order.
+    pub fn dead_letters(&self) -> Result<Vec<QueueEntry>> {
+        let mut entries = Vec::new();
+        for result in std::fs::read_dir(&self.dlq_dir)? {
+            let path = result?.path();
+            if !path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                continue;
+            }
+            if let Some(entry) = self.read_entry(&path) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|a, b| (&a.source, &a.session_id).cmp(&(&b.source, &b.session_id)));
+        Ok(entries)
+    }
+
+    /// Restore a dead letter to the live queue, resetting retry bookkeeping.
+    /// Any already queued event is merged so its newer activity is retained.
+    pub fn requeue_dead_letter(&self, source: &str, session_id: &str) -> Result<PathBuf> {
+        let _queue_lock = self.lock_queue()?;
+        let dlq_path = self.dead_letter_path(source, session_id);
+        let dead_letter = self.read_entry(&dlq_path).ok_or_else(|| {
+            anyhow!(
+                "dead-letter entry not found or unreadable: {}",
+                dlq_path.display()
+            )
+        })?;
+        if dead_letter.source != source || dead_letter.session_id != session_id {
+            return Err(anyhow!(
+                "dead-letter path does not match the requested source and session"
+            ));
+        }
+
+        let queue_path = self.entry_path(source, session_id);
+        let queued = self.read_entry(&queue_path);
+        let restored = QueueEntry {
+            schema: SCHEMA_VERSION,
+            source: dead_letter.source.clone(),
+            session_id: dead_letter.session_id.clone(),
+            project_hint: queued
+                .as_ref()
+                .and_then(|entry| entry.project_hint.clone())
+                .or_else(|| dead_letter.project_hint.clone()),
+            enqueued_at: queued
+                .as_ref()
+                .map(|entry| entry.enqueued_at.min(dead_letter.enqueued_at))
+                .unwrap_or(dead_letter.enqueued_at),
+            last_event_at: queued
+                .as_ref()
+                .map(|entry| entry.last_event_at.max(dead_letter.last_event_at))
+                .unwrap_or(dead_letter.last_event_at),
+            ended: dead_letter.ended || queued.as_ref().is_some_and(|entry| entry.ended),
+            attempts: 0,
+            next_retry_at: 0,
+            last_error: None,
+        };
+
+        self.write_atomic(&queue_path, &restored)?;
+        std::fs::remove_file(&dlq_path)
+            .with_context(|| format!("remove restored dead-letter {}", dlq_path.display()))?;
+        Ok(queue_path)
     }
 
     fn read_entry(&self, path: &Path) -> Option<QueueEntry> {
@@ -210,6 +301,7 @@ impl QueueManager {
     /// we worked on it. Returns `false` when the entry changed (caller must not mark the
     /// session processed; the next run will re-visit it).
     pub fn ack_if_unchanged(&self, entry: &QueueEntry, fingerprint: u64) -> Result<bool> {
+        let _queue_lock = self.lock_queue()?;
         let path = self.entry_path(&entry.source, &entry.session_id);
         match self.read_entry(&path) {
             None => Ok(true), // already gone (e.g. DLQ'd concurrently): nothing to do
@@ -226,6 +318,7 @@ impl QueueManager {
 
     /// Record a processing failure: exponential backoff (15min · 2^(n−1)), then dead-letter.
     pub fn nack(&self, entry: &QueueEntry, error: &str, max_attempts: u32) -> Result<()> {
+        let _queue_lock = self.lock_queue()?;
         let path = self.entry_path(&entry.source, &entry.session_id);
         let Some(mut current) = self.read_entry(&path) else {
             return Ok(()); // entry vanished; nothing to nack
@@ -280,21 +373,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let qm = QueueManager::new(&tmp.path().join("queue")).expect("queue");
         (qm, tmp)
-    }
-
-    fn ended_entry(source: &str, id: &str) -> QueueEntry {
-        QueueEntry {
-            schema: 1,
-            source: source.into(),
-            session_id: id.into(),
-            project_hint: None,
-            enqueued_at: now_ms() - 3_600_000,
-            last_event_at: now_ms() - 3_600_000,
-            ended: true,
-            attempts: 0,
-            next_retry_at: 0,
-            last_error: None,
-        }
     }
 
     #[test]
@@ -403,6 +481,84 @@ mod tests {
         assert!(!path.exists(), "entry should be dead-lettered");
         let dlq = tmp.path().join("queue/.dlq/claude--bad.json");
         assert!(dlq.exists());
+    }
+
+    #[test]
+    fn requeue_dead_letter_reports_missing_entry() {
+        let (qm, _tmp) = manager();
+        let error = qm
+            .requeue_dead_letter("claude", "missing")
+            .expect_err("missing dead letter must fail");
+        assert!(error.to_string().contains("dead-letter entry not found"));
+        assert!(qm.dead_letters().expect("list dead letters").is_empty());
+    }
+
+    #[test]
+    fn requeue_dead_letter_resets_retry_state_and_removes_dlq() {
+        let (qm, _tmp) = manager();
+        qm.enqueue_event("claude", "retry", Some("proj"), true, 100)
+            .expect("enqueue");
+        let queue_path = qm.entry_path("claude", "retry");
+        let mut entry = qm.read_entry(&queue_path).expect("queued entry");
+        entry.attempts = 5;
+        entry.next_retry_at = now_ms() + 60_000;
+        entry.last_error = Some("persistent failure".into());
+        let dlq_path = qm.dead_letter_path("claude", "retry");
+        qm.write_atomic(&dlq_path, &entry).expect("write DLQ");
+        std::fs::remove_file(&queue_path).expect("remove live entry");
+
+        let listed = qm.dead_letters().expect("list dead letters");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, "retry");
+        assert_eq!(
+            qm.requeue_dead_letter("claude", "retry").expect("requeue"),
+            queue_path
+        );
+
+        let restored = qm.read_entry(&queue_path).expect("restored entry");
+        assert_eq!(restored.attempts, 0);
+        assert_eq!(restored.next_retry_at, 0);
+        assert_eq!(restored.last_error, None);
+        assert_eq!(restored.project_hint.as_deref(), Some("proj"));
+        assert!(
+            !dlq_path.exists(),
+            "DLQ is removed after restoring the queue entry"
+        );
+    }
+
+    #[test]
+    fn requeue_dead_letter_preserves_fresher_queued_event() {
+        let (qm, _tmp) = manager();
+        qm.enqueue_event("claude", "fresh", Some("old-project"), false, 100)
+            .expect("enqueue initial event");
+        let queue_path = qm.entry_path("claude", "fresh");
+        let mut dead_letter = qm.read_entry(&queue_path).expect("initial entry");
+        dead_letter.enqueued_at = 100;
+        dead_letter.attempts = 4;
+        dead_letter.next_retry_at = now_ms() + 60_000;
+        dead_letter.last_error = Some("failure".into());
+        let dlq_path = qm.dead_letter_path("claude", "fresh");
+        qm.write_atomic(&dlq_path, &dead_letter).expect("write DLQ");
+
+        let mut queued = dead_letter.clone();
+        queued.project_hint = Some("new-project".into());
+        queued.enqueued_at = 200;
+        queued.last_event_at = 300;
+        queued.ended = true;
+        queued.attempts = 2;
+        queued.last_error = Some("newer queue failure".into());
+        qm.write_atomic(&queue_path, &queued)
+            .expect("write fresher queued event");
+
+        qm.requeue_dead_letter("claude", "fresh").expect("requeue");
+        let restored = qm.read_entry(&queue_path).expect("restored entry");
+        assert_eq!(restored.last_event_at, 300);
+        assert_eq!(restored.enqueued_at, 100);
+        assert_eq!(restored.project_hint.as_deref(), Some("new-project"));
+        assert!(restored.ended);
+        assert_eq!(restored.attempts, 0);
+        assert_eq!(restored.next_retry_at, 0);
+        assert_eq!(restored.last_error, None);
     }
 
     #[test]

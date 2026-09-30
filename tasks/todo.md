@@ -142,3 +142,76 @@ All cargo runs now: `-j 1`, `CARGO_PROFILE_TEST_DEBUG=0`, memory watchdog
 - Loop quiet since ~10:40 (queue 0, all ticks idle-ok) — expected: ingest cron
   keeps analytics fresh; sessions will sweep in as work happens.
 - Outcome of next proposer run post-install.
+
+# Wiki-loop findings verification — 2026-09-22
+
+Scope: audit the supplied P0–P4 report against current source and available local
+runtime evidence; no implementation, deployment, or live model invocations.
+
+- [x] Read repository instructions, lessons, and current worktree state.
+- [x] Verify P0 control flow and reproduce isolated failure conditions safely.
+- [x] Check P1 runtime claims and distinguish historic evidence from current state.
+- [x] Verify P2–P4 design/operability/test claims with source references.
+- [x] Independently spot-check findings and write tasks/wiki-loop-verification.md.
+
+## Review
+Completed against b9a6460 and a read-only live snapshot. All six P0 mechanisms
+confirmed with qualified impact; corrected stale P1/P2/P4 claims. See
+[tasks/wiki-loop-verification.md](wiki-loop-verification.md) for evidence, isolated
+reproductions, limitations, and implementation sequence. No production changes.
+
+# Wiki-loop correctness fixes within WikiSkill — 2026-09-22
+
+Paper: /apps/pdf2md/papers/wikiskills.pdf, §§3.1–3.2.4, Algorithm 1,
+Appendix C, and prompts E.2–E.3. Preserve immutable raw traces, persistent wiki
+history, incremental consolidation, atomic single-skill proposals, and gated
+skill delivery. Memex's counterfactual validation is an existing adaptation,
+not the paper's held-out benchmark experiment; do not weaken its threshold.
+
+- [x] Read paper and map fixes to its contracts.
+- [x] Fix evidence-free Tier 1 passes and include successful trace evidence.
+- [x] Preserve failed-session retry eligibility and scrub maintainer summaries.
+- [x] Preserve superseded page history and nonempty merge titles.
+- [x] Make proposer truncation UTF-8 safe and scope validation to cited patterns.
+- [x] Add proposer observability/breaker, configured-harness doctor checks, and
+      quiet cron flags; reduce long validation lock scope safely.
+- [x] Address the broken Python example through an auditable correction.
+- [x] Add regression coverage for changed orchestration; run memory-guarded
+      focused tests, formatting, and clippy.
+- [x] Review paper alignment, document remaining design work and verification.
+
+Design boundary: do not delete or truncate archival wiki/audit history to solve
+prompt growth. The paper explicitly gives the maintainer full wiki context and
+the proposer access to history and on-demand reads. A retrieval/compaction change
+requires preserving those semantics, not simply dropping old pages or decisions.
+
+
+## Implementation review
+
+- Added DLQ listing/requeue with queue mutation locking and preserved newer events.
+- Validation now releases delivery/wiki locks while judging, then rechecks the
+  proposal, live skill, staged diff, and motivating pattern pages before committing.
+- Focused suite: 108 passed, 0 failed. `cargo fmt --check` and
+  `cargo clippy -- -D warnings` passed. One pre-existing lib-test warning remains
+  in src/watch.rs (unused crossbeam_channel::unbounded import).
+- Builds use global jobs=2, MALLOC_ARENA_MAX=1, test debug=0, one process-group
+  watchdog with a 1800 MB MemAvailable floor, and the live wiki lock to exclude
+  competing scheduled model jobs. No watchdog kill or VM crash occurred.
+- One-line Python correction staged as
+  prop_1a0cb3d097a_8f2fcc6f2a2542c29fe8; before fails, after passes in Bash and Zsh.
+  Tier 0 passed all six gates; Tier 1 passed (2/2 historical sessions would
+  improve). Applied through normal delivery as v2; deployed example passes in
+  Bash and Zsh, proposal is accepted, and skill-impact.md records the exact diff.
+- Remaining design work: full-context/on-demand wiki access and bounded prompt
+  views preserving complete archives; semantic consolidation; calibrated judge
+  relevance; schema-aware corrective retries. These were not silently substituted
+  for the paper's history or validation semantics.
+
+- Installed tested executable to /root/.local/bin/memex-wiki-loop; previous binary
+  backed up as memex-wiki-loop.pre-correctness-1790116348.bak. Refreshed cron
+  with quiet flags; live doctor passes for all configured opencode roles.
+- Installed proposer dry-run succeeded without a model call; ledger now contains
+  a completed proposer/dry row. Live cron entries checked for quiet flags.
+- Final live checks: Python v2 matches the reviewed one-line correction; latest
+  non-retired deployment is v2 (ledger keeps earlier unretired history rows and
+  defines current via MAX(version)); accepted proposal and audit entry agree.

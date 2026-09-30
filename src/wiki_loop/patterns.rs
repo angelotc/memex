@@ -359,7 +359,9 @@ impl PatternStore {
         // blanking it: the maintainer refines sections, and must be able to leave
         // one alone.
         let mut meta = existing.clone();
-        meta.title = scrubbed.title.clone();
+        if !scrubbed.title.trim().is_empty() {
+            meta.title = scrubbed.title.clone();
+        }
         meta.updated = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         if scrubbed.scope.is_some() {
             meta.scope = sanitize_scope(scrubbed.scope.as_deref().unwrap())?;
@@ -426,13 +428,18 @@ impl PatternStore {
         meta.superseded_by = Some(replacement_id);
         meta.updated = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-        let content = Self::render(
-            &meta,
-            &scrubbed.symptom,
-            &scrubbed.root_cause,
-            &scrubbed.fix,
-            "",
-        );
+        let existing_content = std::fs::read_to_string(&path)?;
+        let content = update_frontmatter_fields(
+            &existing_content,
+            &[
+                ("status", meta.status.as_str()),
+                ("updated", meta.updated.as_str()),
+                (
+                    "superseded_by",
+                    meta.superseded_by.as_deref().unwrap_or("null"),
+                ),
+            ],
+        )?;
         self.write_atomic(&path, &content)?;
         Ok(PatternWrite {
             file: path,
@@ -553,6 +560,28 @@ fn section_text<'a>(incoming: &'a str, existing: &'a str) -> &'a str {
     } else {
         incoming
     }
+}
+
+/// Update selected frontmatter values while preserving the page body byte-for-byte.
+fn update_frontmatter_fields(content: &str, fields: &[(&str, &str)]) -> Result<String> {
+    let Some(frontmatter_and_body) = content.strip_prefix("---\n") else {
+        bail!("pattern page is missing its frontmatter opening delimiter");
+    };
+    let Some((frontmatter, body)) = frontmatter_and_body.split_once("\n---\n") else {
+        bail!("pattern page is missing its frontmatter closing delimiter");
+    };
+
+    let mut lines: Vec<String> = frontmatter.lines().map(str::to_owned).collect();
+    for (key, value) in fields {
+        let prefix = format!("{key}:");
+        if let Some(line) = lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+            *line = format!("{key}: {}", first_line(value));
+        } else {
+            lines.push(format!("{key}: {}", first_line(value)));
+        }
+    }
+
+    Ok(format!("---\n{}\n---\n{body}", lines.join("\n")))
 }
 
 /// Collapse any run of CR/LF into a single space; a newline inside a frontmatter
@@ -814,6 +843,27 @@ mod tests {
     }
 
     #[test]
+    fn merge_with_empty_title_preserves_existing_title() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+        let create = op("create", "kept-title", &["s1"]);
+        let write = store
+            .apply_op(&create, &create, &corroboration(&["s1"]))
+            .expect("create");
+
+        let mut merge = op("merge", "kept-title", &["s2"]);
+        merge.existing_id = Some(write.pattern_id.clone());
+        merge.title = " \t ".into();
+        let merged = store
+            .apply_op(&merge, &merge, &corroboration(&["s2"]))
+            .expect("merge");
+
+        let content = std::fs::read_to_string(merged.file).expect("read merged page");
+        let (meta, _) = PatternStore::parse_frontmatter(&content).expect("parse frontmatter");
+        assert_eq!(meta.title, create.title);
+    }
+
+    #[test]
     fn create_for_existing_slug_promotes_to_merge() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = PatternStore::new(tmp.path()).expect("store");
@@ -1049,10 +1099,17 @@ mod tests {
                 &corroboration(&["s1"]),
             )
             .expect("create");
+        let original = std::fs::read_to_string(&write.file).expect("read original page");
+        let original_body = original.split_once("\n---\n").expect("frontmatter").1;
+
         let mut sup = op("supersede", "old-way", &[]);
         sup.existing_id = Some(write.pattern_id.clone());
+        sup.symptom = "replacement symptom must not replace history".into();
+        sup.root_cause = "replacement cause must not replace history".into();
+        sup.fix = "replacement fix must not replace history".into();
+        sup.evidence_summary = "replacement evidence must not replace history".into();
         store.apply_op(&sup, &sup, &[]).expect("supersede");
-        let (_, meta) = store
+        let (path, meta) = store
             .catalog()
             .expect("catalog")
             .values()
@@ -1061,6 +1118,23 @@ mod tests {
             .clone();
         assert_eq!(meta.status, "superseded");
         assert!(meta.superseded_by.is_some());
+
+        let superseded = std::fs::read_to_string(path).expect("read superseded page");
+        let superseded_body = superseded.split_once("\n---\n").expect("frontmatter").1;
+        assert_eq!(
+            superseded_body, original_body,
+            "retirement preserves full body"
+        );
+        assert!(superseded_body.contains("Corroborated across sessions: s1"));
+        assert!(!superseded_body.contains("replacement symptom"));
+        let (superseded_meta, _) =
+            PatternStore::parse_frontmatter(&superseded).expect("parse frontmatter");
+        assert_eq!(
+            superseded_meta.corroboration.len(),
+            1,
+            "retirement preserves corroboration metadata"
+        );
+        assert_eq!(superseded_meta.corroboration[0].session_id, "s1");
     }
 
     #[test]

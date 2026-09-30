@@ -184,7 +184,7 @@ impl StateLedger {
     pub fn recent_runs(&self, limit: i64) -> Result<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, role, started_at, ended_at, status, sessions_read, patterns_written, error
-             FROM runs ORDER BY started_at DESC LIMIT ?",
+             FROM runs ORDER BY started_at DESC, id DESC LIMIT ?",
         )?;
         let rows = stmt
             .query_map(params![limit], |row| {
@@ -207,7 +207,7 @@ impl StateLedger {
     pub fn consecutive_failures(&self, role: &str) -> Result<u32> {
         let mut stmt = self
             .conn
-            .prepare("SELECT status FROM runs WHERE role = ? ORDER BY started_at DESC LIMIT 10")?;
+            .prepare("SELECT status FROM runs WHERE role = ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 10")?;
         let mut failures = 0u32;
         let mut rows = stmt.query(params![role])?;
         while let Some(row) = rows.next()? {

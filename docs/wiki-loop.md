@@ -41,10 +41,11 @@ The stages follow the paper's Algorithm 1:
    cleared the quiet window, stratified per Appendix C into up to **5 failing** traces
    (root-cause analysis) and up to **3 passing** traces (successful-strategy extraction,
    regression prevention), oldest first. Overflow sessions stay queued for the next run.
-3. **Maintain** — the Wiki Maintainer sees the **full text of existing pattern pages**
-   plus the stratified digest, consolidates failure *and* success patterns, revises
-   `index.md`, and appends to `logs.md`. Merges preserve prior sections the model leaves
-   empty, union corroboration, and append evidence.
+3. **Maintain** — the Wiki Maintainer sees up to the **30 most recently updated pattern
+   pages** (each capped at 2,000 characters, with a 40 KiB total page budget) plus the
+   stratified digest, consolidates failure *and* success patterns, revises `index.md`, and
+   appends to `logs.md`. Merges preserve prior sections the model leaves empty, union
+   corroboration, and append evidence. Older pages can be absent from a run's prompt.
 4. **Propose** — the Skill Proposer reads the wiki index and the
    `skill-impact.md` audit trail **first** (so rejected interventions are never re-proposed),
    then corroborated patterns and active skills, and emits at most one **atomic** single-skill
@@ -53,10 +54,14 @@ The stages follow the paper's Algorithm 1:
    the human, so they must not spend the budget.
 5. **Gate** — Tier 0 static hygiene (secret rescan, slug, scope stamp, dedup,
    recently-rejected, referenced-path existence — checked against the contributing projects,
-   failing closed), then a Tier 1 counterfactual judge that replays the motivating
-   patterns' corroborating (failure-mode) sessions first, topped up with recent project
-   history; its assessments are reconciled
-   one-to-one against the sessions actually digested.
+   failing closed), then a Tier 1 counterfactual judge over up to `tier1_sessions` complete
+   sessions (default 5), within half of `max_chars_per_batch` bytes. Replay starts with
+   corroborating sessions from the motivating patterns, then tops up with recent sessions
+   from the contributing project(s). The resulting evidence can mix failing and passing
+   sessions; Tier 1 does not force Appendix C's maintainer 5/3 split. Passing-session
+   strategies are judged too; having no error turns is not itself a pass. Missing, partial,
+   unreadable, or otherwise unusable evidence fails closed instead of skipping the judge.
+   The judge's assessments are reconciled one-to-one against sessions actually digested.
 6. **Apply / roll back** — a human applies a validated proposal; every decision (including
    `validate` rejections) is appended to `skill-impact.md`. Skills revert to the prior
    version — pre-existing hand-authored content is restored from backup, never deleted; the
@@ -75,10 +80,10 @@ validation gate. Production traces are untrusted and real tasks are not replayab
   that hit the failure mode would plausibly have gone better under the candidate skill.
 - **One-shot proposer instead of ReAct.** The paper's proposer is a multi-turn ReAct agent
   that reads pattern pages and raw traces on demand via `read_file`. Cost and harness
-  complexity argue for a single call with the wiki index, the full audit trail, up to 10
-  corroborated pattern pages, and the active skill list pre-stuffed; the proposer therefore
-  cannot inspect raw traces, only the maintainer's compiled evidence. This is the main
-  fidelity gap — revisit if proposals feel uninformed.
+  complexity argue for a single call with the full wiki index and impact audit, up to 10
+  corroborated pattern pages (within a 60 KiB limit), and active skill contents pre-stuffed.
+  The proposer cannot inspect raw traces and may not see older wiki pages outside its
+  candidate set. On-demand retrieval remains a fidelity gap and a future design direction.
 - **Section-level merges instead of span patches.** The paper's maintainer edits pattern
   pages with append/replace/insert_after span operations. Merges here replace whole
   Symptom/Root Cause/Fix sections (the model sees the current page bodies first) and keep
@@ -96,6 +101,38 @@ validation gate. Production traces are untrusted and real tasks are not replayab
   and judge evidence must resolve across every contributing project, failing closed when
   they cannot. (The paper's wiki compounds per benchmark; this loop compounds across all
   projects under the workspace root, with scopes as the attribution layer.)
+
+## Correctness and operations
+
+These behaviors follow the paper's persistent-wiki and gating requirements (§§3.2.2–3.2.4).
+Appendix C's 5-failing/3-passing stratification applies to maintainer sampling; Tier 1 uses
+its own total-session and byte budgets:
+
+- Tier 1 loads up to `tier1_sessions` sessions (default 5) into a digest capped at half of
+  `max_chars_per_batch`. It replays corroborating sessions for the motivating patterns
+  first, then tops up from recent project history. The selected set may contain a mix of
+  failing and passing sessions; unlike maintainer sampling, it has no forced 5/3 split.
+  Missing, incomplete, unreadable, or empty evidence fails closed. Passing sessions are
+  judged as successful-strategy evidence; having no error turns is not itself a pass.
+- If a maintainer pattern operation fails, sessions that supplied that operation's evidence
+  remain queued for retry. If provenance is missing, the maintainer retains the whole
+  selected batch. Superseding a pattern changes its status and replacement metadata while
+  preserving its complete page body and accumulated evidence.
+- Proposer runs appear in the run ledger and status output and have their own three-failure
+  breaker. `run-proposer --force` permits one attempt after the cause is fixed; a failed
+  forced attempt leaves the breaker tripped. The doctor checks the configured executable
+  for each maintainer, proposer, and judge role.
+- Validation releases the delivery lock while the Tier 1 judge runs, then reacquires it and
+  checks that the proposal, deployed skill, and motivating pattern pages are still current before saving a
+  verdict. This keeps a long judge call from blocking apply or rollback while preventing a
+  stale validation result from being committed.
+
+The proposer receives the full `index.md` and full `skill-impact.md` audit trail on each
+run; neither is currently compacted or bounded, so both can grow the prompt over time. The
+maintainer sees only the freshest 30 pattern pages, while the paper's proposer can inspect
+wiki pages and raw traces on demand (§3.2.3). These are current context limits, not a claim
+that history compaction or on-demand retrieval has been implemented; faithful retrieval is
+future work.
 
 ## Install
 
@@ -140,10 +177,12 @@ clobbered (reported as skipped). Rollback removes the links it created.
 memex wiki-loop init [--workspace <dir>] [--install-cron] [--force]
 memex wiki-loop enqueue <source> <session_id> [--project <p>] [--ended]
 memex wiki-loop run-maintainer [--dry-run] [--force]
-memex wiki-loop run-proposer [--dry-run]
+memex wiki-loop run-proposer [--dry-run] [--force]
 memex wiki-loop validate <proposal_id> [--skip-tier1]
 memex wiki-loop apply <proposal_id>
 memex wiki-loop rollback <skill_name>
+memex wiki-loop dead-letters
+memex wiki-loop requeue <source> <session_id>
 memex wiki-loop status
 memex wiki-loop doctor
 ```
@@ -209,16 +248,16 @@ paths — cron has a minimal PATH), the equivalent block is:
 
 ```cron
 # BEGIN memex wiki-loop
-*/5 * * * * /usr/local/bin/memex wiki-loop run-maintainer >> ~/.local/state/wiki-loop/maintainer.log 2>&1
-17 */6 * * * /usr/local/bin/memex wiki-loop run-proposer   >> ~/.local/state/wiki-loop/proposer.log 2>&1
+*/5 * * * * /usr/local/bin/memex --no-update-check --non-interactive wiki-loop run-maintainer >> ~/.local/state/wiki-loop/maintainer.log 2>&1
+17 */6 * * * /usr/local/bin/memex --no-update-check --non-interactive wiki-loop run-proposer >> ~/.local/state/wiki-loop/proposer.log 2>&1
 */10 * * * * /usr/local/bin/memex --no-update-check --non-interactive index >> ~/.local/state/wiki-loop/index.log 2>&1
 # END memex wiki-loop
 ```
 
 Every mutating subcommand takes a `flock`-based role lock, so overlapping runs exit cleanly.
 The maintainer and proposer additionally share a wiki lock, so the proposer never reads a
-wiki mid-write. Three consecutive maintainer failures trip a circuit breaker that notifies
-instead of burning model budget every tick.
+wiki mid-write. Three consecutive failures trip each role's circuit breaker. `--force`
+allows one recovery attempt, and scheduled runs resume automatically after a successful run.
 
 ## Operational notes
 
@@ -227,12 +266,18 @@ instead of burning model budget every tick.
   (e.g. a resumed session) is never acked, and a session whose transcript grew after
   compilation is re-compiled for the new turns — the processed marker records the
   `last_event_at` it covers.
-- **At-least-once processing.** The queue is acked only after a successful run, only if the
+- **At-least-once processing.** A session is acked only after its updates persist, only if the
   entry did not change mid-run, and only after the model returned structured output. An
   empty/unparseable maintainer response fails the run and leaves the batch queued.
+- **Partial maintainer failures.** A failed pattern operation leaves its evidence sessions
+  queued even when other operations in that run succeeded; missing evidence provenance
+  leaves the full batch queued for retry.
 - **Ingest lag is expected.** A session not yet in analytics, or whose index read returns
   fewer records than the session's message count, is retried with exponential backoff and
   dead-lettered after five attempts rather than dropped.
+- **Dead-letter recovery.** `dead-letters` lists parked sessions and their last errors.
+  After fixing the cause, `requeue <source> <session_id>` restores one entry to the live
+  queue, resets its attempt count and retry delay, and removes its dead-letter record.
 - **Wiki discovery.** memex only indexes memory markdown under a source's memory root
   (`~/.claude/projects/<project>/memory/**/*.md`); the wiki directory is **not** auto-indexed.
   The TUI's wiki browser reads it directly (press `r` in it to refresh after a run); symlink it into a memory root as well if

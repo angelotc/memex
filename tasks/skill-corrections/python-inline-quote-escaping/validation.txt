@@ -1,0 +1,4 @@
+bash before: exit=1, stdout=''
+bash after: exit=0, stdout='name=Alice'
+zsh before: exit=1, stdout=''
+zsh after: exit=0, stdout='name=Alice'

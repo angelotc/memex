@@ -33,6 +33,7 @@ struct ProposerOutput {
 struct ExistingSkillSummary {
     name: String,
     description: String,
+    content: String,
 }
 
 pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -> Result<String> {
@@ -58,9 +59,13 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
         std::fs::read_to_string(cfg.wiki_root.join("skill-impact.md")).unwrap_or_default();
 
     let store = super::patterns::PatternStore::new(&cfg.wiki_root)?;
-    let mut candidates: Vec<String> = Vec::new();
-    let mut candidate_scopes: Vec<String> = Vec::new();
-    for (_, (path, meta)) in store.catalog()? {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let catalog = store.catalog()?;
+    let catalog_scopes: BTreeMap<String, String> = catalog
+        .iter()
+        .map(|(id, (_, meta))| (id.clone(), meta.scope.clone()))
+        .collect();
+    for (id, (path, meta)) in &catalog {
         if meta.status == "superseded" || meta.status == "quarantined" {
             continue;
         }
@@ -72,9 +77,8 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
         if distinct.len() < cfg.min_pattern_corroboration {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            candidates.push(content);
-            candidate_scopes.push(meta.scope.clone());
+        if let Ok(content) = std::fs::read_to_string(path) {
+            candidates.push((id.clone(), content));
         }
         if candidates.len() >= 10 {
             break;
@@ -86,28 +90,17 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
             cfg.min_pattern_corroboration
         ));
     }
-    let mut pattern_block = candidates.join("\n\n---\n\n");
-    if pattern_block.len() > 60 * 1024 {
-        pattern_block.truncate(60 * 1024);
-        pattern_block.push_str("\n... [patterns truncated]");
-    }
-
-    // ---- Scope for a new proposal: the unanimous scope of the motivating patterns.
-    // Diverging evidence widens to `global` — which is exactly when the fail-closed
-    // Tier-0/Tier-1 gates get to veto it; it must not silently widen.
-    let scope = proposal_scope_for(&candidate_scopes);
+    let pattern_block = candidates
+        .iter()
+        .map(|(id, body)| format!("## Pattern {id}\n\n{body}"))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let pattern_block = truncate_utf8(&pattern_block, 60 * 1024);
 
     let skills = list_existing_skills(&cfg.skills_root)?;
     let skills_block = serde_json::to_string_pretty(&skills)?;
 
-    let prompt = format!(
-        "{}\n\n## 1. Wiki Index\n\n{}\n\n## 2. Skill-Impact Audit Trail\n\n{}\n\n## 3. Corroborated Pattern Pages\n\n{}\n\n## 4. Existing Active Skills\n\n{}",
-        super::prompts::PROPOSER,
-        index_md,
-        impact_md,
-        pattern_block,
-        skills_block
-    );
+    let prompt = build_proposer_prompt(&index_md, &impact_md, &pattern_block, &skills_block);
 
     if dry_run {
         return Ok(format!(
@@ -147,6 +140,14 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
     if out.skill_markdown.trim().is_empty() {
         bail!("proposer emitted empty skill_markdown");
     }
+
+    // Scope gates to the evidence this proposal names, not every pattern shown in
+    // the prompt. Unrelated projects must not influence its counterfactual judge.
+    let Some(contributing_scopes) = motivating_scopes(&out.purpose_patterns, &catalog_scopes)
+    else {
+        bail!("proposer must cite existing pattern IDs for its motivating evidence");
+    };
+    let scope = proposal_scope_for(&contributing_scopes);
 
     // ---- Stage the proposal directory.
     let id = format!(
@@ -192,10 +193,6 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
     // ---- Gate: Tier 0 always; Tier 1 counterfactual judge, fed the contributing
     // pattern scopes so global-scope proposals replay evidence from every project
     // that motivated them (and fail closed when none resolves).
-    let mut contributing_scopes = candidate_scopes.clone();
-    contributing_scopes.sort();
-    contributing_scopes.dedup();
-
     let tier0_results = super::gates::tier0(
         cfg,
         ledger,
@@ -269,6 +266,41 @@ pub fn run_proposer(cfg: &WikiLoopConfig, ledger: &StateLedger, dry_run: bool) -
     ))
 }
 
+fn build_proposer_prompt(index: &str, impact: &str, patterns: &str, skills: &str) -> String {
+    format!(
+        "{}\n\nFor an existing active skill, prefer an incremental patch to that skill over creating a duplicate. Emit the complete resulting SKILL.md for the single target skill. Use the full skill-impact audit below to avoid repeating rejected or reverted interventions.\n\n## 1. Wiki Index\n\n{}\n\n## 2. Skill-Impact Audit Trail\n\n{}\n\n## 3. Corroborated Pattern Pages\n\n{}\n\n## 4. Existing Active Skills\n\n{}",
+        super::prompts::PROPOSER,
+        index,
+        impact,
+        patterns,
+        skills
+    )
+}
+
+fn truncate_utf8(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_owned();
+    }
+    let mut end = max_bytes;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... [patterns truncated]", &input[..end])
+}
+
+fn motivating_scopes(
+    pattern_ids: &[String],
+    available: &BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    if pattern_ids.is_empty() || pattern_ids.iter().any(|id| !available.contains_key(id)) {
+        return None;
+    }
+    let mut scopes: Vec<String> = pattern_ids.iter().map(|id| available[id].clone()).collect();
+    scopes.sort();
+    scopes.dedup();
+    Some(scopes)
+}
+
 /// Scope for a proposal: the unanimous scope of its motivating patterns when they agree;
 /// diverging evidence is cross-project by definition, so it widens to `global` — where
 /// the strictest gates apply — rather than pinning to whichever project sorted first.
@@ -309,7 +341,11 @@ fn list_existing_skills(skills_root: &Path) -> Result<Vec<ExistingSkillSummary>>
                 String::new(),
             )
         });
-        out.push(ExistingSkillSummary { name, description });
+        out.push(ExistingSkillSummary {
+            name,
+            description,
+            content,
+        });
     }
     Ok(out)
 }
@@ -431,5 +467,49 @@ mod tests {
             "global"
         );
         assert_eq!(proposal_scope_for(&[]), "global");
+    }
+
+    #[test]
+    fn pattern_truncation_preserves_utf8_at_boundary() {
+        let max_bytes = 60 * 1024;
+        let input = format!("{}日", "a".repeat(max_bytes - 1));
+        let truncated = truncate_utf8(&input, max_bytes);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.starts_with(&"a".repeat(max_bytes - 1)));
+        assert!(truncated.ends_with("... [patterns truncated]"));
+    }
+
+    #[test]
+    fn proposal_scopes_follow_only_named_motivating_patterns() {
+        let available = BTreeMap::from([
+            ("pat_a".to_string(), "project:a".to_string()),
+            ("pat_b".to_string(), "project:b".to_string()),
+            ("pat_unselected".to_string(), "project:c".to_string()),
+        ]);
+        let scopes = motivating_scopes(&["pat_a".into(), "pat_a".into()], &available)
+            .expect("known motivating pattern");
+        assert_eq!(scopes, vec!["project:a"]);
+
+        let mixed = motivating_scopes(&["pat_a".into(), "pat_b".into()], &available)
+            .expect("known motivating patterns");
+        assert_eq!(proposal_scope_for(&mixed), "global");
+        assert!(motivating_scopes(&[], &available).is_none());
+        assert!(motivating_scopes(&["pat_a".into(), "missing".into()], &available).is_none());
+        // Valid catalog entries remain valid even if they were outside the 10 prompt pages.
+        assert!(motivating_scopes(&["pat_unselected".into()], &available).is_some());
+    }
+
+    #[test]
+    fn proposer_prompt_keeps_complete_audit_tail_and_all_sections_ordered() {
+        let audit = format!("historical-entry\n{}\nlatest-entry", "x".repeat(70 * 1024));
+        let prompt = build_proposer_prompt("index", &audit, "patterns", "skills");
+        let index_at = prompt.find("## 1. Wiki Index").unwrap();
+        let audit_at = prompt.find("## 2. Skill-Impact Audit Trail").unwrap();
+        let patterns_at = prompt.find("## 3. Corroborated Pattern Pages").unwrap();
+        let skills_at = prompt.find("## 4. Existing Active Skills").unwrap();
+        assert!(index_at < audit_at && audit_at < patterns_at && patterns_at < skills_at);
+        assert!(prompt.contains(&audit));
+        assert!(prompt.ends_with("skills"));
+        assert!(prompt.contains("prefer an incremental patch"));
     }
 }

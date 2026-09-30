@@ -1,0 +1,11 @@
+--- a/python-inline-quote-escaping/SKILL.md
++++ b/python-inline-quote-escaping/SKILL.md
+@@ -26,7 +26,7 @@
+ 2. **Alternate Quotes in Shell One-Liners**
+    When invoking Python from Bash or Zsh, wrap the inline script in single quotes and use double quotes inside Python:
+    ```bash
+-   python3 -c 'import json; data = {"name": "Alice"}; print(f"name={data[\x27name\x27]}")'
++   python3 -c 'data = {"name": "Alice"}; print("name=" + data["name"])'
+    ```
+    Or wrap the shell command in double quotes and use single quotes inside Python:
+    ```bash

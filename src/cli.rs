@@ -66,7 +66,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  wiki-loop    Compile agent experience into wiki + skills (WikiSkill)\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  wiki         Search the experience wiki (wiki-loop patterns)\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  wiki-loop    Compile agent experience into wiki + skills (WikiSkill)\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -777,6 +777,11 @@ EXAMPLES:
     WikiLoop {
         #[command(subcommand)]
         command: crate::wiki_loop::WikiLoopCommand,
+    },
+    /// Search the experience wiki compiled by wiki-loop
+    Wiki {
+        #[command(subcommand)]
+        command: crate::wiki_loop::WikiCommand,
     },
     /// Deprecated alias for interactive `memex skill install`
     #[command(hide = true)]
@@ -1974,6 +1979,9 @@ pub fn run() -> Result<()> {
         }
         Commands::WikiLoop { command } => {
             crate::wiki_loop::cli::run(command)?;
+        }
+        Commands::Wiki { command } => {
+            crate::wiki_loop::cli::run_wiki(command)?;
         }
         Commands::Setup { force } => {
             eprintln!("warning: `memex setup` is deprecated; use `memex skill install`");

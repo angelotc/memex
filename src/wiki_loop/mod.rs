@@ -17,7 +17,7 @@
 
 pub mod cli;
 
-pub use cli::WikiLoopCommand;
+pub use cli::{WikiCommand, WikiLoopCommand};
 mod collect;
 pub mod config;
 mod digest;
@@ -33,6 +33,7 @@ mod patterns;
 mod proposer;
 mod queue;
 mod scrub;
+pub mod search;
 
 /// Prompt templates and output schemas, embedded at compile time (house style:
 /// `include_str!`). Schemas are materialized to disk per run and passed to harnesses

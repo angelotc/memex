@@ -1,7 +1,7 @@
-//! CLI surface for `memex wiki-loop <subcommand>`.
+//! CLI surface for `memex wiki-loop <subcommand>` and the read-only `memex wiki <subcommand>`.
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use super::config::WikiLoopConfig;
@@ -14,6 +14,7 @@ use super::lock::RoleLock;
 use super::patterns::{PatternStore, scrub_op};
 use super::proposer;
 use super::queue::{QueueEntry, QueueManager, now_ms};
+use super::search::{self, WikiSearchOptions};
 use crate::types::Record;
 
 #[derive(Debug, Subcommand)]
@@ -80,6 +81,86 @@ pub enum WikiLoopCommand {
     Status,
     /// Check prerequisites (binaries, paths, stores)
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WikiCommand {
+    /// Search wiki patterns (failure modes + fixes) compiled from past agent sessions
+    Search {
+        /// Keywords or raw error text
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Only global patterns plus those scoped to this project
+        #[arg(long)]
+        project: Option<String>,
+        /// Only `failure` or `success` patterns
+        #[arg(long, value_parser = ["failure", "success"])]
+        kind: Option<String>,
+        /// Include superseded patterns
+        #[arg(long)]
+        all: bool,
+        /// Output encoding
+        #[arg(long, value_enum, default_value = "text")]
+        format: WikiFormat,
+    },
+    /// Print a wiki pattern page by id or slug
+    Show { key: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WikiFormat {
+    /// One card per hit, fields truncated
+    Text,
+    /// One untruncated hit per line
+    Jsonl,
+    /// A pretty-printed array of untruncated hits
+    Json,
+}
+
+pub fn run_wiki(command: WikiCommand) -> Result<()> {
+    let cfg = WikiLoopConfig::load(None)?;
+    match command {
+        WikiCommand::Search {
+            query,
+            limit,
+            project,
+            kind,
+            all,
+            format,
+        } => {
+            if limit == 0 {
+                bail!("limit must be at least 1");
+            }
+            let opts = WikiSearchOptions {
+                limit,
+                project,
+                kind,
+                include_superseded: all,
+            };
+            let hits = search::search(&cfg.wiki_root, &query, &opts)?;
+            match format {
+                WikiFormat::Text => print!("{}", search::format_text(&hits)),
+                WikiFormat::Jsonl => {
+                    for hit in &hits {
+                        println!("{}", serde_json::to_string(hit)?);
+                    }
+                }
+                WikiFormat::Json => println!("{}", serde_json::to_string_pretty(&hits)?),
+            }
+            Ok(())
+        }
+        WikiCommand::Show { key } => {
+            let path = search::resolve(&cfg.wiki_root, &key)?;
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            print!("{content}");
+            if !content.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        }
+    }
 }
 
 pub fn run(command: WikiLoopCommand) -> Result<()> {

@@ -191,6 +191,21 @@ The maintainer writes the live wiki directly. There is no staging split: the wik
 append-only by construction and the human gate sits at skill delivery, where mistakes are
 reversible.
 
+## Searching the wiki
+
+`memex wiki` is the read side: agents look up known failure modes and fixes before
+re-debugging them.
+
+```bash
+memex wiki search "psql root.crt no such file" [--limit 5] [--project <p>] [--kind failure|success] [--all] [--format text|jsonl|json]
+memex wiki show psql-missing-root-crt-system-ca   # by slug, file name, or pat_ id
+```
+
+`search` ranks `patterns/*.md` by BM25 over title, slug, and body. Raw error text is
+safe to paste; punctuation and operators are neutralized. Superseded pages are hidden
+unless `--all` is passed, and `--project` keeps global patterns plus those scoped to
+that project. `show` prints the whole page, frontmatter included.
+
 ## Configuration
 
 Optional, at `~/.memex/wiki-loop.toml`. Defaults apply when the file is absent.

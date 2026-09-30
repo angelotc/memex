@@ -215,3 +215,186 @@ requires preserving those semantics, not simply dropping old pages or decisions.
 - Final live checks: Python v2 matches the reviewed one-line correction; latest
   non-retired deployment is v2 (ledger keeps earlier unretired history rows and
   defines current via MAX(version)); accepted proposal and audit entry agree.
+
+# Connect the wiki to working agents (scope, 2026-09-30)
+
+Goal: agents on this box get the relevant wiki pattern at the moment it applies, we
+can measure use and effect, and the loop's own evidence doesn't get contaminated.
+
+## Evidence (2026-09-30)
+- Pipeline is healthy (1014 sessions → 350 patterns), but agents use none of it.
+  The 2 skills are symlinked into all 6 harness skill dirs
+  (`link_skill_into_harnesses`, gates.rs:667) and appear in skill listings. Organic
+  invocations in 8 days: 0.
+- The wiki has no discovery path: no CLAUDE.md/AGENTS.md pointer, no hook, no MCP. No
+  harness registers memex MCP.
+- Retrieval mechanics are fine. BM25 over pattern text ranked the right page #1 on
+  6/6 real error strings. The content is the problem:
+  - 349/350 pages are `candidate`, and 202 have a single corroborating session.
+  - Median title is 652 chars, and 283 titles exceed 150 chars, with session UUIDs
+    embedded.
+  - Duplicate families: psql root.crt ×5, python quoting ×5-7, zsh nomatch ×5.
+- Paper §5.1/Table 3: giving the inference agent wiki access during *training
+  rollouts* cut avg 63.7→60.9, because the knowledge comes from the wiki instead of
+  the skills and the traces become less informative. This does not argue against
+  deployed use, but injected sessions must be tagged before they feed back into the
+  loop. The paper also leaves skill/wiki retrieval and pruning unsolved.
+
+## Approach (decided)
+Push via hooks plus pull via CLI, both backed by a new `memex wiki-loop lookup` inside
+src/wiki_loop.
+- Not skill-only: passive skills already failed (0 uses).
+- Not a memex memory source: memory documents are keyed by `provider: SourceKind`
+  (a harness enum with about 30 match sites) and ignore frontmatter, so they can't
+  filter status/corroboration/scope. `memex search --content memories` also takes
+  about 1.05 s.
+- `PatternStore::parse_frontmatter`/`catalog()` (patterns.rs:93,240) already give
+  status, kind, scope and corroboration. tantivy 0.22 is already a dependency, and
+  a 350-doc in-RAM BM25 index takes milliseconds.
+
+## Phase 0: prerequisites
+- [ ] Commit the uncommitted 2026-09-22 correctness work. It is 11 files,
+      +1411/−267 (gates/patterns/proposer/judge.md/cli/ledger/queue…). The cron
+      binary already runs it, but the tree doesn't record it. New work touches the
+      same files. **Needs user OK.**
+- [ ] Replace the 660 MB debug `memex-wiki-loop` (0.22.0) with a release build of the
+      branch, because hook latency matters. Follow lessons.md build safety: jobs=2,
+      MALLOC_ARENA_MAX=1, ≥4 GB free, watchdog, no concurrent build or proposer.
+
+## Phase 1: gate what agents see (no archive deletion, per design boundary above)
+- [ ] patterns.rs write path: titles must be ≤100 chars with no `(Instance: …)` or
+      session metadata. Trim or reject on write, and update the maintainer prompt.
+- [ ] One-off retitle backfill for the existing 350 pages. The history and
+      corroboration stay intact.
+- [ ] Eligibility for lookup (computed at lookup time; no status rewrite):
+      - not superseded;
+      - corroboration ≥2, OR kind=failure with an exact error-token match;
+      - `project:<x>` pages only when cwd resolves to project x.
+- [ ] Known v1 limitation: duplicate families can both surface. Real consolidation
+      stays in "remaining design work".
+
+## Phase 2: `memex wiki-loop lookup` (+ `show`)
+- [ ] Command:
+      `lookup <query> [--cwd] [--limit 3] [--min-score] [--session-id] [--harness]
+      [--event prompt|tool-failure] [--format text|json]`
+      - BM25 over title + Symptom + Fix of eligible pages.
+      - Each hit gives: short title, a one-line symptom, the fix, the id, and a
+        `wiki-loop show <id>` pointer.
+      - Total output is capped at about 600 tokens. It is **empty when nothing clears
+        min-score**, which should be the common case.
+- [ ] `wiki-loop show <id>` prints the full page (if it doesn't already exist).
+- [ ] Ledger table `injections(ts, session_id, harness, event, query_sha, pattern_ids,
+      withheld)`. Every lookup that returns hits writes a row. This is the usage
+      metric.
+- [ ] Holdout using the existing unused `holdout` table: a deterministic
+      hash(session_id) puts about 20% of sessions in holdout. For those, lookup is
+      computed and logged with withheld=1 but not emitted.
+- [ ] Tests: eligibility, scope filter, min-score empty path, output cap, holdout
+      determinism. Latency target: p95 <150 ms on the release build.
+
+## Phase 3a: hooks for Claude Code 2.1.285 + Codex 0.159 (verified hook APIs)
+- [ ] `memex wiki-loop hook <claude|codex|agy> <prompt|tool-failure>` reads the
+      harness stdin JSON, extracts the query (prompt text, or the stderr/error tail of
+      a failed tool), calls lookup, and prints the harness's `additionalContext` JSON.
+      It **always exits 0 and fails open**: on timeout or any error it prints nothing.
+- [ ] Claude Code:
+      - `PostToolUse` on Bash, emitting only when exit≠0 or the result is an error.
+        First verify whether 2.1.285 has a separate failure event.
+      - `UserPromptSubmit` with a higher min-score.
+- [ ] Codex:
+      - `UserPromptSubmit`, plus `PostToolUse` (verify it fires on non-zero exit).
+      - `[features] hooks = true` is already on. Handle the hook trust hash.
+- [ ] `wiki-loop init --install-hooks`: an idempotent merge into ~/.claude/settings.json
+      and ~/.codex/hooks.json. It preserves the existing herdr SessionStart hooks and
+      writes a backup first. **User confirms before touching harness config.**
+
+## Phase 3b: agy 1.2.12 + opencode v2.0.16 (partly unverified APIs)
+- [ ] agy: `PreInvocation` → `additionalContext`. The query comes from `transcript_path`
+      (last user message or tool error), and the first call needs dedupe. Hooks live
+      in ~/.gemini/config/hooks.json, alongside the herdr entry.
+- [ ] opencode: a V2 plugin in ~/.config/opencode/plugins/ using
+      `ctx.session.hook("context")` and shelling out to the same `hook` command.
+
+## Phase 4: pull fallbacks (cheap)
+- [ ] Add a 5-line block to skills/memex-search/SKILL.md: "on an unfamiliar error run
+      `memex wiki-loop lookup "<error text>"` first".
+- [ ] Add a one-line pointer in /apps/CLAUDE.md and ~/.codex/AGENTS.md, and create
+      ~/.config/opencode/AGENTS.md and GEMINI.md. **User-owned files: confirm.**
+- [ ] Deferred: a `wiki_lookup` tool in src/mcp.rs, and registering `memex mcp` in the
+      harnesses (none do today).
+
+## Phase 5: close the loop
+- [ ] Collector/digest: tag sessions that have rows in `injections`, and mark them in
+      proposer/judge evidence so wiki-fed wins aren't credited to skills (paper §5.1).
+- [ ] `wiki-loop status` adds:
+      - injections per week by harness and event, and the top patterns;
+      - the withheld count;
+      - recurrence of the targeted failure later in the same session, injected vs
+        holdout;
+      - Skill-tool invocations of /apps/skills skills, from transcripts.
+
+## Success criteria (2 weeks after 3a)
+- Injections happen daily, and at least 70% of 20 spot-checked injections are
+  relevant.
+- Under 5% of prompts get an injection, hook p95 is under 200 ms, and no session is
+  blocked or broken by a hook.
+- Directional result: targeted-failure recurrence is lower for injected sessions than
+  for holdout.
+
+## Open decisions
+1. Phase 0 commit of the Sep 22 work: OK?
+2. Roll out Claude Code + Codex first (3a), then agy/opencode (3b)?
+3. Eligibility: corroboration ≥2 only (148 pages), or also single-session failure
+   pages on exact error matches (recommended)?
+4. Holdout rate of 20%?
+
+## Build now: `memex wiki search` / `memex wiki show` (user-approved 2026-09-30)
+The user named the command `memex wiki search "query"`: a top-level `wiki`, not a
+`wiki-loop` subcommand. This slice is pull only. Hooks, the injections ledger and
+the holdout stay in the phases above.
+- [x] `src/wiki_loop/search.rs`:
+      - Build an in-RAM tantivy index (en_stem, the memory_search.rs:889 idiom) over
+        each pattern's title (boost 2.0), slug words (boost 1.5) and body.
+      - Sanitize the query: non-alphanumerics become spaces, and bare AND/OR/NOT are
+        lowercased, so raw error text never fails to parse.
+      - Exclude superseded pages unless `--all`.
+      - `--project X` keeps pages scoped `global` or `project:X`. `--kind` filters
+        failure or success.
+- [x] `memex wiki search <QUERY> [--limit 5] [--project] [--kind] [--all]
+      [--format text|jsonl|json]`. The default is compact text cards: slug, badges,
+      title truncated to 140 chars, Symptom/Fix snippets, and a `show` pointer. JSON
+      carries the full fields.
+- [x] `memex wiki show <ID|SLUG>` prints the page.
+- [x] Wiring: top-level `Commands::Wiki` in src/cli.rs, a help-template line, and
+      tests in search.rs.
+- [x] Gates (orchestrator only): fmt, clippy -D warnings, focused tests, release
+      build. Install to /root/.local/bin/memex after backing it up. Probe with real
+      error strings and check latency.
+- [x] Point /apps/CLAUDE.md and the Codex AGENTS.md at `memex wiki search`.
+
+### Review (2026-09-30)
+- Deviations from spec, all accepted:
+  - The whole query is lowercased. tantivy also reserves bare `IN` and `TO`, and
+    en_stem lowercases anyway.
+  - Superseded hits get a marker under `--all`.
+  - `--limit 0` is rejected.
+- The first version created directories on a read (via `PatternStore::new`). I
+  replaced that with a read-only `wiki_root.join("patterns")`, the same way
+  cli.rs:993 and tui.rs:7139 read the wiki.
+- Gates:
+  - `cargo fmt --check` OK. `cargo clippy -- -D warnings` OK.
+  - `cargo test --lib wiki_loop::` 115/115 (7 new).
+  - Release build took 2m27s.
+  - All ran under a process-group watchdog with an 1800 MB floor. MemAvailable
+    never went below 5.9 GB.
+- Live probes on the 350-page wiki: 5/5 real error strings rank a correct page #1
+  (psql root.crt, python f-string, wrangler EROFS, zsh nomatch, helius ws). Each
+  query takes about 0.15 s and 33 MB RSS. Duplicate families show up as #1–#3
+  (curation is Phase 1).
+- Installed the release build to /root/.local/bin/memex. The previous binary is at
+  memex.pre-wiki-search.bak. The cron `memex-wiki-loop` (debug, Sep 22) is untouched.
+- Pointers added to /apps/CLAUDE.md, /apps/AGENTS.md (identical copies) and
+  ~/.codex/AGENTS.md. /apps is not a git repo, so Codex in a sub-repo never reads
+  /apps/AGENTS.md; the global file covers that case.
+- Still unwired: opencode (~/.config/opencode/AGENTS.md) and agy (GEMINI.md).
+  Hooks (push) remain Phase 3.

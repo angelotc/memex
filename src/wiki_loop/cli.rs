@@ -1310,7 +1310,7 @@ mod tests {
         let output = MaintainerOutput {
             patterns: vec![
                 operation("create", "good", &["good", "both"]),
-                operation("merge", "bad", &["bad", "both"]),
+                operation("merge", "", &["bad", "both"]),
             ],
             summary: "One write failed".into(),
         };
@@ -1337,7 +1337,7 @@ mod tests {
             let ledger = StateLedger::open(&cfg.state_db).unwrap();
             let c = candidate(&queue, "session");
             let output = MaintainerOutput {
-                patterns: vec![operation("merge", "missing", &sessions)],
+                patterns: vec![operation("merge", "", &sessions)],
                 summary: "failed".into(),
             };
             assert!(persist_maintainer_output(&store, &queue, &ledger, 1, &[&c], &output).is_err());

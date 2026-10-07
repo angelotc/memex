@@ -267,13 +267,26 @@ impl PatternStore {
         scrubbed: &PatternOp,
         evidence: &[Corroboration],
     ) -> Result<PatternWrite> {
-        let Some(slug) = normalize_slug(&op.slug) else {
+        // A merge is addressed by `existing_id`, so its slug is optional (the model
+        // emits `""` for merges); create and supersede need one to name a page.
+        let slug = normalize_slug(&op.slug);
+        if slug.is_none() && op.action != "merge" {
             bail!("pattern slug `{}` normalizes to nothing", op.slug);
-        };
+        }
         // Downstream paths are built from the scrubbed copy; pin it to the normalized
-        // slug so a divergence between the two can never reach the filesystem.
+        // slug (empty when absent) so a divergence can never reach the filesystem.
+        let slug = slug.unwrap_or_default();
         let mut scrubbed = scrubbed.clone();
         scrubbed.slug = slug.clone();
+        // A blank scope is an absent one (the model emits `""` on merges): merges keep
+        // the page's scope, creates default to global.
+        if scrubbed
+            .scope
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            scrubbed.scope = None;
+        }
         let mut op = op.clone();
         op.slug = slug;
         match op.action.as_str() {
@@ -348,7 +361,22 @@ impl PatternStore {
         };
         let catalog = self.catalog()?;
         let Some((path, existing)) = catalog.get(existing_id) else {
-            bail!("merge target `{existing_id}` not found in catalog");
+            // Stale or wiped id: fall back to the op's slug. `create` already promotes
+            // to a merge when that slug has a page; a brand-new page needs a title.
+            if scrubbed.slug.is_empty() {
+                bail!("merge target `{existing_id}` not found in catalog");
+            }
+            let page = self.patterns_dir().join(format!("{}.md", scrubbed.slug));
+            if !page.exists() && scrubbed.title.trim().is_empty() {
+                bail!("merge target `{existing_id}` not found in catalog and op has no title");
+            }
+            let mut write = self.create(op, scrubbed, evidence)?;
+            eprintln!(
+                "warning: merge target `{existing_id}` not in catalog; fell back via slug `{}`",
+                scrubbed.slug
+            );
+            write.action = format!("{} (merge fallback)", write.action);
+            return Ok(write);
         };
         let path = path.clone();
         let existing = existing.clone();
@@ -1205,5 +1233,115 @@ mod tests {
             .expect("quarantine");
         assert!(path.starts_with(store.quarantine_dir()));
         assert!(store.catalog().expect("catalog").is_empty());
+    }
+
+    #[test]
+    fn merge_with_empty_slug_uses_existing_page() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+        let create = op("create", "kept-slug", &["s1"]);
+        let write = store
+            .apply_op(&create, &create, &corroboration(&["s1"]))
+            .expect("create");
+
+        // Live maintainer output: merges carry the id and leave slug/title/scope blank.
+        let mut merge = op("merge", "", &["s2"]);
+        merge.existing_id = Some(write.pattern_id.clone());
+        merge.title = String::new();
+        merge.scope = Some(String::new());
+        let merged = store
+            .apply_op(&merge, &merge, &corroboration(&["s2"]))
+            .expect("merge with empty slug");
+        assert_eq!(merged.action, "merged");
+        assert_eq!(
+            merged.file, write.file,
+            "merge must patch the page in place"
+        );
+        assert_eq!(merged.pattern_id, write.pattern_id);
+        assert_eq!(store.catalog().expect("catalog").len(), 1);
+        let content = std::fs::read_to_string(&merged.file).expect("read");
+        let (meta, _) = PatternStore::parse_frontmatter(&content).expect("frontmatter");
+        assert_eq!(meta.title, create.title);
+        assert_eq!(
+            meta.scope,
+            sanitize_scope(create.scope.as_deref().unwrap()).unwrap()
+        );
+        assert_eq!(meta.corroboration.len(), 2);
+    }
+
+    #[test]
+    fn merge_with_unknown_id_falls_back_to_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+
+        // No page for the slug: degrade to a create, keeping the evidence.
+        let mut merge = op("merge", "wiped-page", &["s1"]);
+        merge.existing_id = Some("pat_stale".into());
+        let write = store
+            .apply_op(&merge, &merge, &corroboration(&["s1"]))
+            .expect("fallback create");
+        assert_eq!(write.action, "created (merge fallback)");
+        assert_eq!(write.file, store.patterns_dir().join("wiped-page.md"));
+        let content = std::fs::read_to_string(&write.file).expect("read");
+        let (meta, _) = PatternStore::parse_frontmatter(&content).expect("frontmatter");
+        assert_eq!(meta.corroboration.len(), 1);
+
+        // Page now exists under that slug: a stale id merges into it.
+        let mut again = op("merge", "wiped-page", &["s2"]);
+        again.existing_id = Some("pat_other_stale".into());
+        let write2 = store
+            .apply_op(&again, &again, &corroboration(&["s2"]))
+            .expect("fallback merge");
+        assert_eq!(write2.action, "merged (merge fallback)");
+        assert_eq!(write2.pattern_id, write.pattern_id);
+        assert_eq!(store.catalog().expect("catalog").len(), 1);
+    }
+
+    #[test]
+    fn merge_with_unknown_id_and_no_slug_or_title_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+
+        let mut no_slug = op("merge", "", &["s1"]);
+        no_slug.existing_id = Some("pat_stale".into());
+        let err = store
+            .apply_op(&no_slug, &no_slug, &corroboration(&["s1"]))
+            .err()
+            .expect("unknown id without slug must fail");
+        assert!(err.to_string().contains("not found in catalog"));
+
+        let mut no_title = op("merge", "untitled", &["s1"]);
+        no_title.existing_id = Some("pat_stale".into());
+        no_title.title = "  ".into();
+        assert!(
+            store
+                .apply_op(&no_title, &no_title, &corroboration(&["s1"]))
+                .is_err()
+        );
+        assert!(store.catalog().expect("catalog").is_empty());
+    }
+
+    #[test]
+    fn create_and_supersede_still_require_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = PatternStore::new(tmp.path()).expect("store");
+        let create = op("create", "", &["s1"]);
+        assert!(
+            store
+                .apply_op(&create, &create, &corroboration(&["s1"]))
+                .is_err()
+        );
+
+        let page = op("create", "old-page", &["s1"]);
+        let write = store
+            .apply_op(&page, &page, &corroboration(&["s1"]))
+            .expect("create");
+        let mut supersede = op("supersede", "", &["s2"]);
+        supersede.existing_id = Some(write.pattern_id.clone());
+        let err = store
+            .apply_op(&supersede, &supersede, &corroboration(&["s2"]))
+            .err()
+            .expect("supersede without slug must fail");
+        assert!(err.to_string().contains("normalizes to nothing"));
     }
 }
